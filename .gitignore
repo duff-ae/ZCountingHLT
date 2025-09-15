@@ -1,0 +1,13 @@
+# .gitignore
+*.log
+*.out
+*.err
+*.root
+logs/
+
+
+# Python bytecode
+__init__.py
+__pycache__/
+*.py[cod]
+*.so
