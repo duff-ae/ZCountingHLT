@@ -5,8 +5,7 @@ cmsrel CMSSW_15_0_6
 cd CMSSW_15_0_6/src
 cmsenv
 
-mkdir Demo
-cd Demo
+mkdir Demo && cd Demo
 
 git clone https://github.com/duff-ae/ZCountingHLT HLTScouting
 
