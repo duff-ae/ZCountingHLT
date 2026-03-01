@@ -7,4 +7,4 @@ input_file="inFile=$1"
 output_file="outFile=$2"
 echo "Starting cmsRun with input file $input_file"
 
-cmsRun python/mc_cfg.py $input_file $output_file
+cmsRun python/wntuple_cfg.py $input_file $output_file

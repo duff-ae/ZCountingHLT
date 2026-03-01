@@ -1,8 +1,23 @@
 <use name="FWCore/Framework"/>
 <use name="FWCore/ParameterSet"/>
-<use name="FWCore/Service"/>
-<use name="CommonTools/UtilAlgos"/>
+<use name="FWCore/ServiceRegistry"/>   <!-- вместо FWCore/Service -->
+<use name="CommonTools/UtilAlgos"/>    <!-- TFileService -->
+
+<!-- Наши форматы данных -->
 <use name="DataFormats/Scouting"/>
-<use name="L1Trigger/L1TGlobal"/>
+<use name="DataFormats/HepMCCandidate"/>  <!-- reco::GenParticle -->
+<use name="DataFormats/Candidate"/>       <!-- базовый reco::Candidate -->
+<use name="SimDataFormats/GeneratorProducts"/>
+<use name="SimDataFormats/PileupSummaryInfo"/>
+<use name="DataFormats/BeamSpot"/>
+<use name="DataFormats/PatCandidates"/>
+<use name="DataFormats/MuonReco"/>
+<use name="DataFormats/Math"/>
+
+<!-- ROOT -->
 <use name="root"/>
-<flags EDM_PLUGIN="1"/>
+<use name="rootcore"/>
+
+<use name="L1Trigger/L1TGlobal"/>
+<use name="CondFormats/L1TObjects"/>
+<use name="tmEventSetup"/>

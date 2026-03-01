@@ -1,0 +1,1613 @@
+// ===========================
+// ScoutingHiggsRho.cc  (BLOCK 1/3)
+// ===========================
+// Step 1 (stable base): GEN-only, with inclusive + fiducial duplicate histograms,
+// plus event diagnostics. Scouting/PAT/L1/trigger layers will plug into the same
+// modular structure later (same canonical candidates + same hist groups).
+
+#include "FWCore/Framework/interface/one/EDAnalyzer.h"
+#include "FWCore/Framework/interface/Event.h"
+#include "FWCore/Framework/interface/EventSetup.h"
+#include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/ParameterSet/interface/ParameterSet.h"
+#include "FWCore/Utilities/interface/InputTag.h"
+#include "FWCore/ServiceRegistry/interface/Service.h"
+
+#include "CommonTools/UtilAlgos/interface/TFileService.h"
+
+#include "DataFormats/Candidate/interface/Candidate.h"
+#include "DataFormats/HepMCCandidate/interface/GenParticle.h"
+#include "DataFormats/PatCandidates/interface/PackedGenParticle.h"
+#include "DataFormats/JetReco/interface/GenJet.h"
+#include "DataFormats/JetReco/interface/GenJetCollection.h"
+#include "DataFormats/Math/interface/deltaR.h"
+
+#include "DataFormats/Scouting/interface/Run3ScoutingPhoton.h"
+#include "DataFormats/Scouting/interface/Run3ScoutingTrack.h"
+#include "DataFormats/Scouting/interface/Run3ScoutingParticle.h"
+#include "DataFormats/Scouting/interface/Run3ScoutingPFJet.h"
+
+#include "SimDataFormats/GeneratorProducts/interface/GenEventInfoProduct.h"
+#include "SimDataFormats/PileupSummaryInfo/interface/PileupSummaryInfo.h"
+
+#include "TH1F.h"
+#include "TH2F.h"
+#include "TLorentzVector.h"
+
+#include <vector>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <algorithm>
+
+namespace {
+  constexpr float M_PI_CH = 0.13957039f;
+  constexpr float M_RHO   = 0.77526f;
+  constexpr float M_H     = 125.0f;
+
+  inline float toF(double x) { return static_cast<float>(x); }
+  inline float toF(float  x) { return x; }
+  inline float toF(int    x) { return static_cast<float>(x); }
+
+  inline void setP4_massless(TLorentzVector& v, float pt, float eta, float phi) { v.SetPtEtaPhiM(pt, eta, phi, 0.0); }
+  inline void setP4_pion(TLorentzVector& v, float pt, float eta, float phi)     { v.SetPtEtaPhiM(pt, eta, phi, M_PI_CH); }
+
+  inline bool passAbsEta(float eta, float maxAbsEta) { return (maxAbsEta <= 0.f) ? true : (std::abs(eta) < maxAbsEta); }
+
+  struct SimpleCand {
+    float pt{0.f}, eta{0.f}, phi{0.f}, mass{0.f};
+    int charge{0}; // 0 for neutral
+  };
+
+  struct RhoCand {
+    SimpleCand piPlus;
+    SimpleCand piMinus;
+    TLorentzVector p4;
+    float mass{ -1.f };
+    float pt()  const { return toF(p4.Pt()); }
+    float eta() const { return toF(p4.Eta()); }
+    float phi() const { return toF(p4.Phi()); }
+  };
+
+  struct HCand {
+    SimpleCand gamma;
+    RhoCand rho;
+    TLorentzVector p4;
+    float mass{ -1.f };
+    float pt()  const { return toF(p4.Pt()); }
+    float eta() const { return toF(p4.Eta()); }
+    float phi() const { return toF(p4.Phi()); }
+  };
+
+  // A clean bounded DFS on reco::Candidate mother pointers.
+  inline bool hasAncestorPdgIdAbs(const reco::Candidate* start, int absPdgId, int guardMax = 300) {
+    if (!start) return false;
+    std::vector<const reco::Candidate*> stack;
+    stack.reserve(32);
+    const size_t nm0 = start->numberOfMothers();
+    for (size_t i = 0; i < nm0; ++i) {
+      const reco::Candidate* m = start->mother(i);
+      if (m) stack.push_back(m);
+    }
+    int guard = 0;
+    while (!stack.empty() && guard++ < guardMax) {
+      const reco::Candidate* cur = stack.back();
+      stack.pop_back();
+      if (!cur) continue;
+      if (std::abs(cur->pdgId()) == absPdgId) return true;
+      const size_t nm = cur->numberOfMothers();
+      for (size_t i = 0; i < nm; ++i) {
+        const reco::Candidate* mm = cur->mother(i);
+        if (mm) stack.push_back(mm);
+      }
+    }
+    return false;
+  }
+
+  // ----------------------------
+  // PF kinematics policy
+  // ----------------------------
+  inline bool pf_canUseTrkKinematics(const Run3ScoutingParticle& p, bool wantUseTrkVars) {
+    if (!wantUseTrkVars) return false;
+    return !p.relative_trk_vars();
+  }
+  inline float pf_pt(const Run3ScoutingParticle& p, bool wantUseTrkVars)  { return pf_canUseTrkKinematics(p, wantUseTrkVars) ? toF(p.trk_pt())  : toF(p.pt()); }
+  inline float pf_eta(const Run3ScoutingParticle& p, bool wantUseTrkVars) { return pf_canUseTrkKinematics(p, wantUseTrkVars) ? toF(p.trk_eta()) : toF(p.eta()); }
+  inline float pf_phi(const Run3ScoutingParticle& p, bool wantUseTrkVars) { return pf_canUseTrkKinematics(p, wantUseTrkVars) ? toF(p.trk_phi()) : toF(p.phi()); }
+
+  inline float deltaR2(float eta1, float phi1, float eta2, float phi2) {
+    const float dEta = eta1 - eta2;
+    float dPhi = std::fabs(phi1 - phi2);
+    if (dPhi > float(M_PI)) dPhi = float(2.0*M_PI) - dPhi;
+    return dEta*dEta + dPhi*dPhi;
+  }
+
+  inline float absDeltaPhi(float phi1, float phi2) {
+    float dphi = std::fabs(phi1 - phi2);
+    if (dphi > float(M_PI)) dphi = float(2.0*M_PI) - dphi;
+    return dphi;
+  }
+
+  // Choose best OS pion pair closest to rho mass.
+  inline bool bestPionPairToRho(const std::vector<SimpleCand>& pions, SimpleCand& piPlus, SimpleCand& piMinus, RhoCand& rhoOut) {
+    float bestDiff = std::numeric_limits<float>::infinity();
+    bool found = false;
+    TLorentzVector best; float bestMass = -1.f;
+    SimpleCand bestP{}, bestM{};
+    for (size_t i = 0; i < pions.size(); ++i) {
+      for (size_t j = i + 1; j < pions.size(); ++j) {
+        const auto& a = pions[i];
+        const auto& b = pions[j];
+        if (a.charge * b.charge >= 0) continue;
+        TLorentzVector va, vb;
+        setP4_pion(va, a.pt, a.eta, a.phi);
+        setP4_pion(vb, b.pt, b.eta, b.phi);
+        TLorentzVector v = va + vb;
+        const float m = toF(v.M());
+        const float diff = std::abs(m - M_RHO);
+        if (diff < bestDiff) {
+          bestDiff = diff; best = v; bestMass = m; found = true;
+          if (a.charge > 0) { bestP = a; bestM = b; } else { bestP = b; bestM = a; }
+        }
+      }
+    }
+    if (!found) return false;
+    piPlus = bestP; piMinus = bestM;
+    rhoOut.piPlus = bestP; rhoOut.piMinus = bestM; rhoOut.p4 = best; rhoOut.mass = bestMass;
+    return true;
+  }
+
+  // ----------------------------
+  // Histogram packs
+  // ----------------------------
+  struct GenHistPack {
+    TH1F* h_H_pt{nullptr}; TH1F* h_H_eta{nullptr};
+    TH1F* h_g_pt{nullptr}; TH1F* h_g_eta{nullptr};
+    TH1F* h_pi_pt{nullptr}; TH1F* h_pi_eta{nullptr}; TH1F* h_n_pi{nullptr};
+    TH1F* h_rho_m{nullptr}; TH1F* h_rho_pt{nullptr}; TH1F* h_dr_pi_pi{nullptr};
+    TH1F* h_dr_g_rho{nullptr}; TH1F* h_ptbal_rho_g{nullptr};
+    TH1F* h_hcand_m{nullptr}; TH1F* h_hcand_pt{nullptr};
+    TH2F* h_rho_m_vs_pt{nullptr}; TH2F* h_hcand_m_vs_pt{nullptr};
+
+    void book(TFileDirectory& dir, const std::string& label) {
+      h_H_pt  = dir.make<TH1F>(("H_pt_"+label).c_str(),  "GEN Higgs p_{T};p_{T} [GeV];events", 200, 0., 400.);
+      h_H_eta = dir.make<TH1F>(("H_eta_"+label).c_str(), "GEN Higgs #eta;#eta;events",         120, -6., 6.);
+      h_g_pt  = dir.make<TH1F>(("g_pt_"+label).c_str(),  "GEN #gamma p_{T};p_{T} [GeV];events", 200, 0., 400.);
+      h_g_eta = dir.make<TH1F>(("g_eta_"+label).c_str(), "GEN #gamma #eta;#eta;events",         120, -6., 6.);
+      h_pi_pt  = dir.make<TH1F>(("pi_pt_"+label).c_str(),  "GEN #pi^{#pm} p_{T};p_{T} [GeV];cands", 200, 0., 100.);
+      h_pi_eta = dir.make<TH1F>(("pi_eta_"+label).c_str(), "GEN #pi^{#pm} #eta;#eta;cands",         120, -6., 6.);
+      h_n_pi   = dir.make<TH1F>(("n_pi_"+label).c_str(),   "N_{#pi^{#pm}} candidates;N;cands",       60, -0.5, 59.5);
+      h_rho_m   = dir.make<TH1F>(("rho_m_"+label).c_str(),   "GEN m(#pi#pi) (best OS);m [GeV];events", 200, 0., 2.0);
+      h_rho_pt  = dir.make<TH1F>(("rho_pt_"+label).c_str(),  "GEN #rho cand p_{T};p_{T} [GeV];events", 200, 0., 250.);
+      h_dr_pi_pi = dir.make<TH1F>(("dr_pi_pi_"+label).c_str(), "GEN #DeltaR(#pi,#pi);#DeltaR;events", 120, 0., 6.0);
+      h_dr_g_rho   = dir.make<TH1F>(("dr_g_rho_"+label).c_str(),   "GEN #DeltaR(#gamma,#rho);#DeltaR;events", 120, 0., 6.0);
+      h_ptbal_rho_g = dir.make<TH1F>(("ptbal_rho_g_"+label).c_str(), "GEN p_{T}(#rho)/p_{T}(#gamma);ratio;events", 120, 0., 3.0);
+      h_hcand_m  = dir.make<TH1F>(("hcand_m_"+label).c_str(),  "GEN m(#pi#pi#gamma);m [GeV];events", 240, 0., 240.);
+      h_hcand_pt = dir.make<TH1F>(("hcand_pt_"+label).c_str(), "GEN p_{T}(#pi#pi#gamma);p_{T} [GeV];events", 200, 0., 400.);
+      h_rho_m_vs_pt   = dir.make<TH2F>(("rho_m_vs_pt_"+label).c_str(),   "GEN m(#pi#pi) vs p_{T}(#rho);p_{T} [GeV];m [GeV]", 120, 0., 240., 120, 0., 2.0);
+      h_hcand_m_vs_pt = dir.make<TH2F>(("hcand_m_vs_pt_"+label).c_str(), "GEN m(Hcand) vs p_{T}(Hcand);p_{T} [GeV];m [GeV]", 120, 0., 360., 120, 0., 240.);
+    }
+
+    void fillH(const reco::GenParticle& H) { if (h_H_pt) h_H_pt->Fill(toF(H.pt())); if (h_H_eta) h_H_eta->Fill(toF(H.eta())); }
+    void fillGamma(const SimpleCand& g) { if (h_g_pt) h_g_pt->Fill(g.pt); if (h_g_eta) h_g_eta->Fill(g.eta); }
+    void fillPions(const std::vector<SimpleCand>& pions) {
+      if (h_n_pi) h_n_pi->Fill(toF((int)pions.size()));
+      for (const auto& pi : pions) { if (h_pi_pt) h_pi_pt->Fill(pi.pt); if (h_pi_eta) h_pi_eta->Fill(pi.eta); }
+    }
+    void fillRho(const RhoCand& rho) {
+      if (h_rho_m) h_rho_m->Fill(rho.mass);
+      if (h_rho_pt) h_rho_pt->Fill(toF(rho.p4.Pt()));
+      if (h_rho_m_vs_pt) h_rho_m_vs_pt->Fill(toF(rho.p4.Pt()), rho.mass);
+      const float dr = toF(reco::deltaR(rho.piPlus.eta, rho.piPlus.phi, rho.piMinus.eta, rho.piMinus.phi));
+      if (h_dr_pi_pi) h_dr_pi_pi->Fill(dr);
+    }
+    void fillHcand(const HCand& hc) {
+      if (h_hcand_m) h_hcand_m->Fill(hc.mass);
+      if (h_hcand_pt) h_hcand_pt->Fill(toF(hc.p4.Pt()));
+      if (h_hcand_m_vs_pt) h_hcand_m_vs_pt->Fill(toF(hc.p4.Pt()), hc.mass);
+      const float dr = toF(reco::deltaR(hc.gamma.eta, hc.gamma.phi, hc.rho.eta(), hc.rho.phi()));
+      if (h_dr_g_rho) h_dr_g_rho->Fill(dr);
+      if (hc.gamma.pt > 0.f) { const float r = hc.rho.pt() / hc.gamma.pt; if (h_ptbal_rho_g) h_ptbal_rho_g->Fill(r); }
+    }
+  };
+
+  struct ScoutHistPack {
+    TH1F* h_g_pt{nullptr}; TH1F* h_g_eta{nullptr};
+    TH1F* h_tk_pt{nullptr}; TH1F* h_tk_eta{nullptr}; TH1F* h_tk_dxy{nullptr}; TH1F* h_tk_dz{nullptr}; TH1F* h_tk_layers{nullptr};
+    TH1F* h_rho_m{nullptr}; TH1F* h_rho_pt{nullptr};
+    TH1F* h_hcand_m{nullptr}; TH1F* h_hcand_pt{nullptr};
+    TH1F* h_dr_g_rho{nullptr};
+
+    void book(TFileDirectory& dir, const std::string& label) {
+      h_g_pt  = dir.make<TH1F>(("g_pt_"+label).c_str(),  "SCOUT #gamma p_{T};p_{T} [GeV];events", 200, 0., 400.);
+      h_g_eta = dir.make<TH1F>(("g_eta_"+label).c_str(), "SCOUT #gamma #eta;#eta;events",         120, -6., 6.);
+      h_tk_pt     = dir.make<TH1F>(("tk_pt_"+label).c_str(),     "SCOUT track p_{T};p_{T} [GeV];tracks", 200, 0., 50.);
+      h_tk_eta    = dir.make<TH1F>(("tk_eta_"+label).c_str(),    "SCOUT track #eta;#eta;tracks",         120, -3., 3.);
+      h_tk_dxy    = dir.make<TH1F>(("tk_dxy_"+label).c_str(),    "SCOUT track dxy;dxy [cm];tracks",      200, -0.5, 0.5);
+      h_tk_dz     = dir.make<TH1F>(("tk_dz_"+label).c_str(),     "SCOUT track dz;dz [cm];tracks",        200, -1.0, 1.0);
+      h_tk_layers = dir.make<TH1F>(("tk_layers_"+label).c_str(), "SCOUT nLayers;nLayers;tracks",          40, -0.5, 39.5);
+      h_rho_m  = dir.make<TH1F>(("rho_m_"+label).c_str(),   "SCOUT m(#pi#pi);m [GeV];events", 200, 0., 2.0);
+      h_rho_pt = dir.make<TH1F>(("rho_pt_"+label).c_str(),  "SCOUT #rho p_{T};p_{T} [GeV];events", 200, 0., 250.);
+      h_hcand_m  = dir.make<TH1F>(("hcand_m_"+label).c_str(),  "SCOUT m(#pi#pi#gamma);m [GeV];events", 240, 0., 240.);
+      h_hcand_pt = dir.make<TH1F>(("hcand_pt_"+label).c_str(), "SCOUT p_{T}(#pi#pi#gamma);p_{T} [GeV];events", 200, 0., 400.);
+      h_dr_g_rho = dir.make<TH1F>(("dr_g_rho_"+label).c_str(), "SCOUT #DeltaR(#gamma,#rho);#DeltaR;events", 120, 0., 6.0);
+    }
+
+    void fillPhoton(const SimpleCand& g) { if (h_g_pt) h_g_pt->Fill(g.pt); if (h_g_eta) h_g_eta->Fill(g.eta); }
+    void fillTrackInclusive(const Run3ScoutingTrack& t) {
+      if (h_tk_pt) h_tk_pt->Fill(toF(t.tk_pt()));
+      if (h_tk_eta) h_tk_eta->Fill(toF(t.tk_eta()));
+      if (h_tk_layers) h_tk_layers->Fill(toF(t.tk_nTrackerLayersWithMeasurement()));
+      if (h_tk_dxy) h_tk_dxy->Fill(toF(t.tk_dxy()));
+      if (h_tk_dz) h_tk_dz->Fill(toF(t.tk_dz()));
+    }
+    void fillRho(const RhoCand& rho) { if (h_rho_m) h_rho_m->Fill(rho.mass); if (h_rho_pt) h_rho_pt->Fill(toF(rho.p4.Pt())); }
+    void fillHcand(const HCand& hc) {
+      if (h_hcand_m) h_hcand_m->Fill(hc.mass);
+      if (h_hcand_pt) h_hcand_pt->Fill(toF(hc.p4.Pt()));
+      if (h_dr_g_rho) h_dr_g_rho->Fill(toF(reco::deltaR(hc.gamma.eta, hc.gamma.phi, hc.rho.eta(), hc.rho.phi())));
+    }
+    void fillParticleInclusive(const Run3ScoutingParticle& p, bool useTrkVars=false) {
+      const float pt  = useTrkVars ? toF(p.trk_pt())  : toF(p.pt());
+      const float eta = useTrkVars ? toF(p.trk_eta()) : toF(p.eta());
+      if (h_tk_pt)  h_tk_pt->Fill(pt);
+      if (h_tk_eta) h_tk_eta->Fill(eta);
+      if (h_tk_dxy) h_tk_dxy->Fill(toF(p.dxy()));
+      if (h_tk_dz)  h_tk_dz->Fill(toF(p.dz()));
+    }
+  };
+
+  struct MatchHistPack {
+    TH1F* h_dr2_g{nullptr};
+    TH1F* h_dr2_piPlus{nullptr};
+    TH1F* h_dr2_piMinus{nullptr};
+    TH1F* h_resp_g_pt{nullptr};
+    TH1F* h_resp_rho_m{nullptr};
+    TH1F* h_resp_hcand_m{nullptr};
+    TH1F* h_resp_rho_m_q{nullptr};
+
+    TH1F* h_eff_g_den{nullptr}; TH1F* h_eff_g_num{nullptr};
+    TH1F* h_eff_rho_den{nullptr}; TH1F* h_eff_rho_num{nullptr};
+    TH1F* h_eff_g_den_fid{nullptr}; TH1F* h_eff_g_num_fid{nullptr};
+    TH1F* h_eff_rho_den_fid{nullptr}; TH1F* h_eff_rho_num_fid{nullptr};
+
+    TH1F* h_dr2_rho_algo_vs_match{nullptr};
+
+    void book(TFileDirectory& dir) {
+      h_dr2_g       = dir.make<TH1F>("dr2_g",      "Match #DeltaR^{2}(#gamma);#DeltaR^{2};events", 120, 0., 0.5);
+      h_dr2_piPlus  = dir.make<TH1F>("dr2_piPlus", "Match #DeltaR^{2}(#pi^{+});#DeltaR^{2};events", 120, 0., 0.5);
+      h_dr2_piMinus = dir.make<TH1F>("dr2_piMinus","Match #DeltaR^{2}(#pi^{-});#DeltaR^{2};events", 120, 0., 0.5);
+      h_resp_g_pt    = dir.make<TH1F>("resp_g_pt",    "p_{T} response #gamma; p_{T}^{scout}/p_{T}^{gen};events", 120, 0., 3.0);
+      h_resp_rho_m   = dir.make<TH1F>("resp_rho_m",   "mass response #rho; m^{scout}-m^{gen} [GeV];events", 160, -0.4, 0.4);
+      h_resp_hcand_m = dir.make<TH1F>("resp_hcand_m", "mass response Hcand; m^{scout}-m^{gen} [GeV];events", 200, -10., 10.);
+      h_eff_g_den   = dir.make<TH1F>("eff_g_den",   "DEN: GEN #gamma p_{T};p_{T}^{gen} [GeV];events", 200, 0., 400.);
+      h_eff_g_num   = dir.make<TH1F>("eff_g_num",   "NUM: matched SCOUT #gamma; p_{T}^{gen} [GeV];events", 200, 0., 400.);
+      h_eff_rho_den = dir.make<TH1F>("eff_rho_den", "DEN: GEN #rho p_{T};p_{T}^{gen} [GeV];events", 200, 0., 250.);
+      h_eff_rho_num = dir.make<TH1F>("eff_rho_num", "NUM: matched SCOUT #rho; p_{T}^{gen} [GeV];events", 200, 0., 250.);
+      h_eff_g_den_fid   = dir.make<TH1F>("eff_g_den_fid",   "DEN(FID): GEN #gamma p_{T};p_{T}^{gen} [GeV];events", 200, 0., 400.);
+      h_eff_g_num_fid   = dir.make<TH1F>("eff_g_num_fid",   "NUM(FID): matched SCOUT #gamma; p_{T}^{gen} [GeV];events", 200, 0., 400.);
+      h_eff_rho_den_fid = dir.make<TH1F>("eff_rho_den_fid", "DEN(FID): GEN #rho p_{T};p_{T}^{gen} [GeV];events", 200, 0., 250.);
+      h_eff_rho_num_fid = dir.make<TH1F>("eff_rho_num_fid", "NUM(FID): matched SCOUT #rho; p_{T}^{gen} [GeV];events", 200, 0., 250.);
+      h_resp_rho_m_q = dir.make<TH1F>("resp_rho_m_q","mass response #rho (matched+quality); m^{scout}-m^{gen} [GeV];events",160,-0.4,0.4);
+      h_dr2_rho_algo_vs_match = dir.make<TH1F>("dr2_rho_algo_vs_match", "#DeltaR^{2}(#rho_{algo},#rho_{match});#DeltaR^{2};events", 120, 0., 1.0);
+    }
+  };
+
+  // PF matched pion-pair correlations (only for "pfc_match" pair)
+  struct PFMatchedPairPack {
+    TH1F* h_piP_pt{nullptr}; TH1F* h_piP_eta{nullptr}; TH1F* h_piP_phi{nullptr}; TH1F* h_piP_dxy{nullptr}; TH1F* h_piP_dz{nullptr};
+    TH1F* h_piP_normchi2{nullptr}; TH1F* h_piP_dxysig{nullptr}; TH1F* h_piP_dzsig{nullptr}; TH1F* h_piP_lostInnerHits{nullptr}; TH1F* h_piP_quality{nullptr};
+    TH1F* h_piM_pt{nullptr}; TH1F* h_piM_eta{nullptr}; TH1F* h_piM_phi{nullptr}; TH1F* h_piM_dxy{nullptr}; TH1F* h_piM_dz{nullptr};
+    TH1F* h_piM_normchi2{nullptr}; TH1F* h_piM_dxysig{nullptr}; TH1F* h_piM_dzsig{nullptr}; TH1F* h_piM_lostInnerHits{nullptr}; TH1F* h_piM_quality{nullptr};
+
+    TH1F* h_pair_m{nullptr}; TH1F* h_pair_pt{nullptr}; TH1F* h_pair_eta{nullptr}; TH1F* h_pair_phi{nullptr}; TH1F* h_pair_dr2{nullptr};
+    TH1F* h_pair_asym{nullptr}; TH1F* h_pair_sameVtx{nullptr}; TH1F* h_pair_dz_diff{nullptr}; TH1F* h_pair_dxy_diff{nullptr};
+    TH2F* h_pi_pt_corr{nullptr}; TH2F* h_pi_eta_corr{nullptr}; TH2F* h_pi_dxy_corr{nullptr}; TH2F* h_pi_dz_corr{nullptr};
+
+    void book(TFileDirectory& dir, const std::string& label) {
+      h_piP_pt  = dir.make<TH1F>(("piP_pt_"+label).c_str(),  "#pi^{+} p_{T};p_{T} [GeV];pairs", 240, 0., 120.);
+      h_piP_eta = dir.make<TH1F>(("piP_eta_"+label).c_str(), "#pi^{+} #eta;#eta;pairs",         160, -4., 4.);
+      h_piP_phi = dir.make<TH1F>(("piP_phi_"+label).c_str(), "#pi^{+} #phi;#phi;pairs",         128, -3.2, 3.2);
+      h_piP_dxy = dir.make<TH1F>(("piP_dxy_"+label).c_str(), "#pi^{+} dxy;dxy [cm];pairs",      200, -0.5, 0.5);
+      h_piP_dz  = dir.make<TH1F>(("piP_dz_"+label).c_str(),  "#pi^{+} dz;dz [cm];pairs",        240, -1.2, 1.2);
+      h_piP_normchi2 = dir.make<TH1F>(("piP_normchi2_"+label).c_str(), "#pi^{+} norm#chi^{2};#chi^{2}/ndof;pairs", 200, 0., 20.);
+      h_piP_dxysig   = dir.make<TH1F>(("piP_dxysig_"+label).c_str(),   "#pi^{+} dxy/#sigma;dxy/#sigma;pairs",       240, -12., 12.);
+      h_piP_dzsig    = dir.make<TH1F>(("piP_dzsig_"+label).c_str(),    "#pi^{+} dz/#sigma;dz/#sigma;pairs",         240, -12., 12.);
+      h_piP_lostInnerHits = dir.make<TH1F>(("piP_lostInnerHits_"+label).c_str(), "#pi^{+} lostInnerHits;lostInnerHits;pairs", 31, -0.5, 30.5);
+      h_piP_quality  = dir.make<TH1F>(("piP_quality_"+label).c_str(),  "#pi^{+} quality;quality;pairs", 256, -0.5, 255.5);
+
+      h_piM_pt  = dir.make<TH1F>(("piM_pt_"+label).c_str(),  "#pi^{-} p_{T};p_{T} [GeV];pairs", 240, 0., 120.);
+      h_piM_eta = dir.make<TH1F>(("piM_eta_"+label).c_str(), "#pi^{-} #eta;#eta;pairs",         160, -4., 4.);
+      h_piM_phi = dir.make<TH1F>(("piM_phi_"+label).c_str(), "#pi^{-} #phi;#phi;pairs",         128, -3.2, 3.2);
+      h_piM_dxy = dir.make<TH1F>(("piM_dxy_"+label).c_str(), "#pi^{-} dxy;dxy [cm];pairs",      200, -0.5, 0.5);
+      h_piM_dz  = dir.make<TH1F>(("piM_dz_"+label).c_str(),  "#pi^{-} dz;dz [cm];pairs",        240, -1.2, 1.2);
+      h_piM_normchi2 = dir.make<TH1F>(("piM_normchi2_"+label).c_str(), "#pi^{-} norm#chi^{2};#chi^{2}/ndof;pairs", 200, 0., 20.);
+      h_piM_dxysig   = dir.make<TH1F>(("piM_dxysig_"+label).c_str(),   "#pi^{-} dxy/#sigma;dxy/#sigma;pairs",       240, -12., 12.);
+      h_piM_dzsig    = dir.make<TH1F>(("piM_dzsig_"+label).c_str(),    "#pi^{-} dz/#sigma;dz/#sigma;pairs",         240, -12., 12.);
+      h_piM_lostInnerHits = dir.make<TH1F>(("piM_lostInnerHits_"+label).c_str(), "#pi^{-} lostInnerHits;lostInnerHits;pairs", 31, -0.5, 30.5);
+      h_piM_quality  = dir.make<TH1F>(("piM_quality_"+label).c_str(),  "#pi^{-} quality;quality;pairs", 256, -0.5, 255.5);
+
+      h_pair_m   = dir.make<TH1F>(("pair_m_"+label).c_str(),   "m(#pi#pi);m [GeV];pairs",              240, 0., 2.4);
+      h_pair_pt  = dir.make<TH1F>(("pair_pt_"+label).c_str(),  "p_{T}(#pi#pi);p_{T} [GeV];pairs",      240, 0., 240.);
+      h_pair_eta = dir.make<TH1F>(("pair_eta_"+label).c_str(), "#eta(#pi#pi);#eta;pairs",              160, -4., 4.);
+      h_pair_phi = dir.make<TH1F>(("pair_phi_"+label).c_str(), "#phi(#pi#pi);#phi;pairs",              128, -3.2, 3.2);
+      h_pair_dr2 = dir.make<TH1F>(("pair_dr2_"+label).c_str(), "#DeltaR^{2}(#pi,#pi);#DeltaR^{2};pairs", 200, 0., 0.5);
+      h_pair_asym= dir.make<TH1F>(("pair_asym_"+label).c_str(),"(p_{T+}-p_{T-})/(p_{T+}+p_{T-});asym;pairs", 200, -1., 1.);
+      h_pair_sameVtx = dir.make<TH1F>(("pair_sameVtx_"+label).c_str(),"vertex(+)==vertex(-);flag;pairs", 2, -0.5, 1.5);
+      h_pair_dz_diff  = dir.make<TH1F>(("pair_dz_diff_"+label).c_str(), "|dz_{+}-dz_{-}|;|#Delta dz| [cm];pairs", 200, 0., 0.5);
+      h_pair_dxy_diff = dir.make<TH1F>(("pair_dxy_diff_"+label).c_str(),"|dxy_{+}-dxy_{-}|;|#Delta dxy| [cm];pairs",200,0.,0.2);
+
+      h_pi_pt_corr  = dir.make<TH2F>(("pi_pt_corr_"+label).c_str(),  "p_{T}(#pi^{+}) vs p_{T}(#pi^{-});p_{T}(#pi^{+}) [GeV];p_{T}(#pi^{-}) [GeV]", 120,0.,120.,120,0.,120.);
+      h_pi_eta_corr = dir.make<TH2F>(("pi_eta_corr_"+label).c_str(), "#eta(#pi^{+}) vs #eta(#pi^{-});#eta(#pi^{+});#eta(#pi^{-})", 120,-3.,3.,120,-3.,3.);
+      h_pi_dxy_corr = dir.make<TH2F>(("pi_dxy_corr_"+label).c_str(), "dxy(#pi^{+}) vs dxy(#pi^{-});dxy(#pi^{+}) [cm];dxy(#pi^{-}) [cm]", 120,-0.3,0.3,120,-0.3,0.3);
+      h_pi_dz_corr  = dir.make<TH2F>(("pi_dz_corr_"+label).c_str(),  "dz(#pi^{+}) vs dz(#pi^{-});dz(#pi^{+}) [cm];dz(#pi^{-}) [cm]",   120,-1.0,1.0,120,-1.0,1.0);
+    }
+
+    void fill(const Run3ScoutingParticle& piP, const Run3ScoutingParticle& piM, bool useTrkVars) {
+      const float ptP  = pf_pt(piP, useTrkVars),  etaP = pf_eta(piP, useTrkVars),  phiP = pf_phi(piP, useTrkVars);
+      const float ptM  = pf_pt(piM, useTrkVars),  etaM = pf_eta(piM, useTrkVars),  phiM = pf_phi(piM, useTrkVars);
+
+      if (h_piP_pt)  h_piP_pt->Fill(ptP);
+      if (h_piP_eta) h_piP_eta->Fill(etaP);
+      if (h_piP_phi) h_piP_phi->Fill(phiP);
+
+      if (h_piP_dxy) h_piP_dxy->Fill(toF(piP.dxy()));
+      if (h_piP_dz)  h_piP_dz->Fill(toF(piP.dz()));
+
+      if (h_piM_pt)  h_piM_pt->Fill(ptM);
+      if (h_piM_eta) h_piM_eta->Fill(etaM);
+      if (h_piM_phi) h_piM_phi->Fill(phiM);
+
+      if (h_piM_dxy) h_piM_dxy->Fill(toF(piM.dxy()));
+      if (h_piM_dz)  h_piM_dz->Fill(toF(piM.dz()));
+      if (h_piM_normchi2) h_piM_normchi2->Fill(toF(piM.normchi2()));
+      if (h_piM_dxysig) h_piM_dxysig->Fill(toF(piM.dxysig()));
+      if (h_piM_dzsig) h_piM_dzsig->Fill(toF(piM.dzsig()));
+      if (h_piM_lostInnerHits) h_piM_lostInnerHits->Fill(toF(piM.lostInnerHits()));
+      if (h_piM_quality) h_piM_quality->Fill(toF(piM.quality()));
+
+      TLorentzVector vP, vM; setP4_pion(vP, ptP, etaP, phiP); setP4_pion(vM, ptM, etaM, phiM);
+      TLorentzVector v = vP + vM;
+
+      if (h_pair_m) h_pair_m->Fill(toF(v.M()));
+      if (h_pair_pt) h_pair_pt->Fill(toF(v.Pt()));
+      if (h_pair_eta) h_pair_eta->Fill(toF(v.Eta()));
+      if (h_pair_phi) h_pair_phi->Fill(toF(v.Phi()));
+      if (h_pair_dr2) h_pair_dr2->Fill(deltaR2(etaP, phiP, etaM, phiM));
+
+      const float denom = (ptP + ptM);
+      if (denom > 0.f && h_pair_asym) h_pair_asym->Fill((ptP - ptM) / denom);
+
+      const bool sameV = (piP.vertex() == piM.vertex());
+      if (h_pair_sameVtx) h_pair_sameVtx->Fill(sameV ? 1.0 : 0.0);
+      if (h_pair_dz_diff)  h_pair_dz_diff->Fill(std::abs(toF(piP.dz())  - toF(piM.dz())));
+      if (h_pair_dxy_diff) h_pair_dxy_diff->Fill(std::abs(toF(piP.dxy()) - toF(piM.dxy())));
+
+      if (h_pi_pt_corr)  h_pi_pt_corr->Fill(ptP, ptM);
+      if (h_pi_eta_corr) h_pi_eta_corr->Fill(etaP, etaM);
+      if (h_pi_dxy_corr) h_pi_dxy_corr->Fill(toF(piP.dxy()), toF(piM.dxy()));
+      if (h_pi_dz_corr)  h_pi_dz_corr->Fill(toF(piP.dz()),  toF(piM.dz()));
+    }
+  };
+
+  struct PFAnalysisPack {
+    TH1F* h_rho_m_all{nullptr}; TH1F* h_rho_pt_all{nullptr}; TH1F* h_rho_dphi_all{nullptr}; TH1F* h_rho_dr2_all{nullptr};
+    TH1F* h_pair_sameVtx_all{nullptr}; TH1F* h_pair_dz_diff_all{nullptr}; TH1F* h_pair_dxy_diff_all{nullptr};
+
+    TH1F* h_hcand_m_all{nullptr}; TH1F* h_hcand_pt_all{nullptr}; TH1F* h_dphi_g_rho_all{nullptr}; TH1F* h_ptbal_rho_g_all{nullptr};
+
+    TH1F* h_rho_m_vtx{nullptr}; TH1F* h_rho_pt_vtx{nullptr}; TH1F* h_hcand_m_vtx{nullptr};
+
+    TH1F* h_rho_m_3body{nullptr}; TH1F* h_rho_pt_3body{nullptr}; TH1F* h_hcand_m_3body{nullptr}; TH1F* h_hcand_pt_3body{nullptr};
+
+    TH1F* h_hcand_m_best{nullptr}; TH1F* h_rho_m_best{nullptr}; TH1F* h_ptbal_rho_g_best{nullptr}; TH1F* h_dphi_g_rho_best{nullptr};
+
+    void book(TFileDirectory& dir) {
+      h_rho_m_all  = dir.make<TH1F>("rho_m_allOS_q",  "PF all OS quality pairs: m(#pi#pi);m [GeV];pairs", 300, 0., 3.0);
+      h_rho_pt_all = dir.make<TH1F>("rho_pt_allOS_q", "PF all OS quality pairs: p_{T}(#pi#pi);p_{T} [GeV];pairs", 400, 0., 200.);
+      h_rho_dphi_all = dir.make<TH1F>("rho_dphi_allOS_q", "PF all OS quality pairs: |#Delta#phi(#pi,#pi)|;|#Delta#phi|;pairs", 128, 0., 3.2);
+      h_rho_dr2_all  = dir.make<TH1F>("rho_dr2_allOS_q", "PF all OS quality pairs: #DeltaR^{2}(#pi,#pi);#DeltaR^{2};pairs", 200, 0., 4.0);
+      h_pair_sameVtx_all = dir.make<TH1F>("pair_sameVtx_allOS_q", "PF all OS quality pairs: same vertex;flag;pairs", 2, -0.5, 1.5);
+      h_pair_dz_diff_all  = dir.make<TH1F>("pair_dz_diff_allOS_q",  "PF all OS quality pairs: |#Deltadz|;|#Deltadz| [cm];pairs", 200, 0., 1.0);
+      h_pair_dxy_diff_all = dir.make<TH1F>("pair_dxy_diff_allOS_q", "PF all OS quality pairs: |#Deltadxy|;|#Deltadxy| [cm];pairs", 200, 0., 0.5);
+
+      h_hcand_m_all  = dir.make<TH1F>("hcand_m_allOS_q",  "PF all OS quality pairs: m(#pi#pi#gamma);m [GeV];cands", 240, 0., 240.);
+      h_hcand_pt_all = dir.make<TH1F>("hcand_pt_allOS_q", "PF all OS quality pairs: p_{T}(#pi#pi#gamma);p_{T} [GeV];cands", 300, 0., 600.);
+      h_dphi_g_rho_all   = dir.make<TH1F>("dphi_g_rho_allOS_q", "|#Delta#phi(#gamma,#rho)|;|#Delta#phi|;cands", 128, 0., 3.2);
+      h_ptbal_rho_g_all  = dir.make<TH1F>("ptbal_rho_g_allOS_q", "p_{T}(#rho)/p_{T}(#gamma);ratio;cands", 120, 0., 3.0);
+
+      h_rho_m_vtx  = dir.make<TH1F>("rho_m_vtx",  "PF OS pairs after sameVtx+dz/dxy: m(#pi#pi);m [GeV];pairs", 300, 0., 3.0);
+      h_rho_pt_vtx = dir.make<TH1F>("rho_pt_vtx", "PF OS pairs after sameVtx+dz/dxy: p_{T}(#rho);p_{T} [GeV];pairs", 400, 0., 200.);
+      h_hcand_m_vtx = dir.make<TH1F>("hcand_m_vtx", "PF after sameVtx+dz/dxy: m(#pi#pi#gamma);m [GeV];cands", 240, 0., 240.);
+
+      h_rho_m_3body  = dir.make<TH1F>("rho_m_3body",  "PF after 3-body cuts: m(#pi#pi);m [GeV];cands", 300, 0., 3.0);
+      h_rho_pt_3body = dir.make<TH1F>("rho_pt_3body", "PF after 3-body cuts: p_{T}(#rho);p_{T} [GeV];cands", 400, 0., 200.);
+      h_hcand_m_3body  = dir.make<TH1F>("hcand_m_3body",  "PF after 3-body cuts: m(#pi#pi#gamma);m [GeV];cands", 240, 0., 240.);
+      h_hcand_pt_3body = dir.make<TH1F>("hcand_pt_3body", "PF after 3-body cuts: p_{T}(#pi#pi#gamma);p_{T} [GeV];cands", 300, 0., 600.);
+
+      h_hcand_m_best = dir.make<TH1F>("hcand_m_best", "PF best cand/event after 3-body cuts: m(#pi#pi#gamma);m [GeV];events", 240, 0., 240.);
+      h_rho_m_best   = dir.make<TH1F>("rho_m_best",   "PF best cand/event after 3-body cuts: m(#pi#pi);m [GeV];events", 300, 0., 3.0);
+      h_ptbal_rho_g_best = dir.make<TH1F>("ptbal_rho_g_best", "PF best cand/event: p_{T}(#rho)/p_{T}(#gamma);ratio;events", 120, 0., 3.0);
+      h_dphi_g_rho_best  = dir.make<TH1F>("dphi_g_rho_best",  "PF best cand/event: |#Delta#phi(#gamma,#rho)|;|#Delta#phi|;events", 128, 0., 3.2);
+    }
+  };
+
+  // ----------------------------
+  // Jet helpers + packs
+  // ----------------------------
+  inline float jetEsum(const Run3ScoutingPFJet& j) {
+    return toF(j.chargedHadronEnergy()) + toF(j.neutralHadronEnergy()) +
+           toF(j.photonEnergy()) + toF(j.electronEnergy()) + toF(j.muonEnergy()) +
+           toF(j.HFHadronEnergy()) + toF(j.HFEMEnergy()) + toF(j.HOEnergy());
+  }
+  inline float jetFrac(const float e, const float esum) { return (esum > 0.f) ? (e / esum) : 0.f; }
+  inline float jetCHF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.chargedHadronEnergy()), s); }
+  inline float jetNHF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.neutralHadronEnergy()), s); }
+  inline float jetPHF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.photonEnergy()), s); }
+  inline float jetELF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.electronEnergy()), s); }
+  inline float jetMUF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.muonEnergy()), s); }
+  inline float jetHFF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.HFHadronEnergy()) + toF(j.HFEMEnergy()), s); }
+  inline float jetHOF(const Run3ScoutingPFJet& j) { const float s=jetEsum(j); return jetFrac(toF(j.HOEnergy()), s); }
+
+  struct ScoutJetHistPack {
+    TH1F* h_jet_pt{nullptr}; TH1F* h_jet_eta{nullptr}; TH1F* h_jet_phi{nullptr}; TH1F* h_jet_m{nullptr}; TH1F* h_jet_area{nullptr};
+    TH1F* h_njet{nullptr}; TH1F* h_ht{nullptr};
+    TH1F* h_j1_pt{nullptr}; TH1F* h_j1_eta{nullptr}; TH1F* h_j2_pt{nullptr}; TH1F* h_j2_eta{nullptr};
+    TH1F* h_mjj{nullptr}; TH1F* h_dphi_jj{nullptr}; TH1F* h_dr2_jj{nullptr};
+    TH1F* h_min_dr2_g_j{nullptr}; TH1F* h_min_dr2_rho_j{nullptr}; TH1F* h_min_dphi_g_j{nullptr}; TH1F* h_min_dphi_rho_j{nullptr};
+    TH1F* h_ptbal_j1_g{nullptr}; TH1F* h_ptbal_j1_rho{nullptr};
+
+    void book(TFileDirectory& dir, const std::string& label) {
+      h_jet_pt   = dir.make<TH1F>(("jet_pt_"+label).c_str(),   "SCOUT jet p_{T};p_{T} [GeV];jets", 300, 0., 600.);
+      h_jet_eta  = dir.make<TH1F>(("jet_eta_"+label).c_str(),  "SCOUT jet #eta;#eta;jets",         160, -5., 5.);
+      h_jet_phi  = dir.make<TH1F>(("jet_phi_"+label).c_str(),  "SCOUT jet #phi;#phi;jets",         128, -3.2, 3.2);
+      h_jet_m    = dir.make<TH1F>(("jet_m_"+label).c_str(),    "SCOUT jet mass;m [GeV];jets",      200, 0., 200.);
+      h_jet_area = dir.make<TH1F>(("jet_area_"+label).c_str(), "SCOUT jet area;area;jets",         120, 0., 2.0);
+      h_njet = dir.make<TH1F>(("njet_"+label).c_str(), "N(jets) (pT/eta sel);N;events", 30, -0.5, 29.5);
+      h_ht   = dir.make<TH1F>(("ht_"+label).c_str(),   "H_{T} (sum jet p_{T});H_{T} [GeV];events", 400, 0., 1200.);
+      h_j1_pt  = dir.make<TH1F>(("j1_pt_"+label).c_str(),  "leading jet p_{T};p_{T} [GeV];events", 300, 0., 600.);
+      h_j1_eta = dir.make<TH1F>(("j1_eta_"+label).c_str(), "leading jet #eta;#eta;events",         160, -5., 5.);
+      h_j2_pt  = dir.make<TH1F>(("j2_pt_"+label).c_str(),  "2nd jet p_{T};p_{T} [GeV];events",     300, 0., 600.);
+      h_j2_eta = dir.make<TH1F>(("j2_eta_"+label).c_str(), "2nd jet #eta;#eta;events",             160, -5., 5.);
+      h_mjj     = dir.make<TH1F>(("mjj_"+label).c_str(),     "dijet mass m_{jj};m_{jj} [GeV];events", 400, 0., 2000.);
+      h_dphi_jj = dir.make<TH1F>(("dphi_jj_"+label).c_str(), "|#Delta#phi(j1,j2)|;|#Delta#phi|;events", 128, 0., 3.2);
+      h_dr2_jj  = dir.make<TH1F>(("dr2_jj_"+label).c_str(),  "#DeltaR^{2}(j1,j2);#DeltaR^{2};events", 200, 0., 25.);
+      h_min_dr2_g_j   = dir.make<TH1F>(("min_dr2_g_j_"+label).c_str(),   "min #DeltaR^{2}(#gamma,jet);#DeltaR^{2};events", 200, 0., 25.);
+      h_min_dr2_rho_j = dir.make<TH1F>(("min_dr2_rho_j_"+label).c_str(), "min #DeltaR^{2}(#rho,jet);#DeltaR^{2};events",   200, 0., 25.);
+      h_min_dphi_g_j  = dir.make<TH1F>(("min_dphi_g_j_"+label).c_str(),  "min |#Delta#phi(#gamma,jet)|;|#Delta#phi|;events", 128, 0., 3.2);
+      h_min_dphi_rho_j= dir.make<TH1F>(("min_dphi_rho_j_"+label).c_str(),"min |#Delta#phi(#rho,jet)|;|#Delta#phi|;events",   128, 0., 3.2);
+      h_ptbal_j1_g   = dir.make<TH1F>(("ptbal_j1_g_"+label).c_str(),   "p_{T}(j1)/p_{T}(#gamma);ratio;events", 160, 0., 8.0);
+      h_ptbal_j1_rho = dir.make<TH1F>(("ptbal_j1_rho_"+label).c_str(), "p_{T}(j1)/p_{T}(#rho);ratio;events",   160, 0., 8.0);
+    }
+
+    void fillJet(const Run3ScoutingPFJet& j) {
+      if (h_jet_pt)   h_jet_pt->Fill(toF(j.pt()));
+      if (h_jet_eta)  h_jet_eta->Fill(toF(j.eta()));
+      if (h_jet_phi)  h_jet_phi->Fill(toF(j.phi()));
+      if (h_jet_m)    h_jet_m->Fill(toF(j.m()));
+      if (h_jet_area) h_jet_area->Fill(toF(j.jetArea()));
+    }
+  };
+
+  struct ScoutJetCompPack {
+    TH1F* h_chf{nullptr}; TH1F* h_nhf{nullptr}; TH1F* h_phf{nullptr};
+    TH1F* h_elf{nullptr}; TH1F* h_muf{nullptr}; TH1F* h_hff{nullptr}; TH1F* h_hof{nullptr};
+    TH1F* h_chMult{nullptr}; TH1F* h_nhMult{nullptr}; TH1F* h_phMult{nullptr};
+    TH1F* h_elMult{nullptr}; TH1F* h_muMult{nullptr}; TH1F* h_hfHadMult{nullptr}; TH1F* h_hfEMMult{nullptr};
+
+    void book(TFileDirectory& dir, const std::string& label) {
+      h_chf = dir.make<TH1F>(("jet_chf_"+label).c_str(), "jet charged hadron frac;frac;jets", 120, 0., 1.2);
+      h_nhf = dir.make<TH1F>(("jet_nhf_"+label).c_str(), "jet neutral hadron frac;frac;jets", 120, 0., 1.2);
+      h_phf = dir.make<TH1F>(("jet_phf_"+label).c_str(), "jet photon frac;frac;jets",         120, 0., 1.2);
+      h_elf = dir.make<TH1F>(("jet_elf_"+label).c_str(), "jet electron frac;frac;jets",       120, 0., 1.2);
+      h_muf = dir.make<TH1F>(("jet_muf_"+label).c_str(), "jet muon frac;frac;jets",           120, 0., 1.2);
+      h_hff = dir.make<TH1F>(("jet_hff_"+label).c_str(), "jet HF frac;frac;jets",             120, 0., 1.2);
+      h_hof = dir.make<TH1F>(("jet_hof_"+label).c_str(), "jet HO frac;frac;jets",             120, 0., 1.2);
+
+      h_chMult    = dir.make<TH1F>(("jet_chMult_"+label).c_str(),    "charged hadron multiplicity;N;jets", 100, -0.5, 99.5);
+      h_nhMult    = dir.make<TH1F>(("jet_nhMult_"+label).c_str(),    "neutral hadron multiplicity;N;jets", 100, -0.5, 99.5);
+      h_phMult    = dir.make<TH1F>(("jet_phMult_"+label).c_str(),    "photon multiplicity;N;jets",         100, -0.5, 99.5);
+      h_elMult    = dir.make<TH1F>(("jet_elMult_"+label).c_str(),    "electron multiplicity;N;jets",       100, -0.5, 99.5);
+      h_muMult    = dir.make<TH1F>(("jet_muMult_"+label).c_str(),    "muon multiplicity;N;jets",           100, -0.5, 99.5);
+      h_hfHadMult = dir.make<TH1F>(("jet_hfHadMult_"+label).c_str(), "HF hadron multiplicity;N;jets",      100, -0.5, 99.5);
+      h_hfEMMult  = dir.make<TH1F>(("jet_hfEMMult_"+label).c_str(),  "HF EM multiplicity;N;jets",          100, -0.5, 99.5);
+    }
+
+    void fill(const Run3ScoutingPFJet& j) {
+      if (h_chf) h_chf->Fill(jetCHF(j));
+      if (h_nhf) h_nhf->Fill(jetNHF(j));
+      if (h_phf) h_phf->Fill(jetPHF(j));
+      if (h_elf) h_elf->Fill(jetELF(j));
+      if (h_muf) h_muf->Fill(jetMUF(j));
+      if (h_hff) h_hff->Fill(jetHFF(j));
+      if (h_hof) h_hof->Fill(jetHOF(j));
+
+      if (h_chMult)    h_chMult->Fill(toF(j.chargedHadronMultiplicity()));
+      if (h_nhMult)    h_nhMult->Fill(toF(j.neutralHadronMultiplicity()));
+      if (h_phMult)    h_phMult->Fill(toF(j.photonMultiplicity()));
+      if (h_elMult)    h_elMult->Fill(toF(j.electronMultiplicity()));
+      if (h_muMult)    h_muMult->Fill(toF(j.muonMultiplicity()));
+      if (h_hfHadMult) h_hfHadMult->Fill(toF(j.HFHadronMultiplicity()));
+      if (h_hfEMMult)  h_hfEMMult->Fill(toF(j.HFEMMultiplicity()));
+    }
+  };
+
+  struct JetMatchHistPack {
+    TH1F* h_genjet_pt_den{nullptr};
+    TH1F* h_genjet_pt_num{nullptr};
+    TH1F* h_dr2{nullptr};
+    TH1F* h_resp_pt{nullptr};
+    TH2F* h_resp_pt_vs_eta{nullptr};
+    TH1F* h_emf{nullptr};
+    TH2F* h_resp_pt_vs_emf{nullptr};
+
+    void book(TFileDirectory& dir) {
+      h_genjet_pt_den = dir.make<TH1F>("genjet_pt_den", "DEN: GEN jet p_{T};p_{T}^{gen} [GeV];jets", 300, 0., 600.);
+      h_genjet_pt_num = dir.make<TH1F>("genjet_pt_num", "NUM: matched SCOUT jet;p_{T}^{gen} [GeV];jets", 300, 0., 600.);
+      h_dr2           = dir.make<TH1F>("dr2_gen_scout", "#DeltaR^{2}(GEN jet, SCOUT jet);#DeltaR^{2};jets", 200, 0., 1.0);
+      h_resp_pt       = dir.make<TH1F>("resp_pt", "p_{T} response; p_{T}^{scout}/p_{T}^{gen};jets", 160, 0., 3.2);
+      h_resp_pt_vs_eta= dir.make<TH2F>("resp_pt_vs_eta", "p_{T} response vs #eta;#eta;p_{T}^{scout}/p_{T}^{gen}", 120, -5., 5., 120, 0., 3.0);
+      h_emf = dir.make<TH1F>("emf", "EM frac (e+#gamma)/sumE;EMF;jets", 120, 0., 1.2);
+      h_resp_pt_vs_emf= dir.make<TH2F>("resp_pt_vs_emf", "p_{T} response vs EMF;EMF;p_{T}^{scout}/p_{T}^{gen}", 120, 0., 1.2, 120, 0., 3.0);
+    }
+  };
+
+} // namespace
+
+class ScoutingHiggsRho : public edm::one::EDAnalyzer<edm::one::SharedResources> {
+public:
+  explicit ScoutingHiggsRho(const edm::ParameterSet&);
+  ~ScoutingHiggsRho() override = default;
+
+  void beginJob() override;
+  void analyze(const edm::Event&, const edm::EventSetup&) override;
+
+private:
+  // ---------------- Config
+  edm::InputTag genEvtTag_, puTag_, prunedGenTag_, packedGenTag_;
+  edm::InputTag phoTag_, tkTag_, pfcTag_;
+  edm::InputTag jetTag_, genJetTag_;
+
+  bool storeGEN_{true};
+  bool storeHistograms_{true};
+
+  float fidPhoMaxAbsEta_{2.5f};
+  float fidPiMaxAbsEta_{2.5f};
+
+  float genPhoMinPt_{0.f};
+  float genPiMinPt_{0.f};
+
+  double phoMinPt_{0.0};
+  double phoMaxAbsEta_{0.0};
+
+  double tkMinPt_{1.0};
+  double tkMaxAbsEta_{2.4};
+  int    tkMinLayers_{8};
+  double tkMaxAbsDz_{0.2};
+  double tkMaxAbsDxy_{0.1};
+
+  float matchPhoDR2_{0.01f};
+  float matchTkDR2_{0.01f};
+  bool  doTruthMatching_{true};
+
+  double pfcMinPt_{1.0};
+  double pfcMaxAbsEta_{2.4};
+  double pfcMaxAbsDz_{0.2};
+  double pfcMaxAbsDxy_{0.1};
+
+  bool pfPionOnly_{true};
+  bool pfUseTrkVars_{false};
+
+  bool   pfRequireSameVtx_{true};
+  double pfMaxAbsDzDiff_{0.05};
+  double pfMaxAbsDxyDiff_{0.05};
+
+  double pfRhoMinPt_{15.0};
+  double pfMinAbsDPhiGRho_{2.7};
+  double pfMinPtBal_{0.5};
+  double pfMaxPtBal_{2.0};
+  double pfRhoMassMin_{0.0};
+  double pfRhoMassMax_{0.0};
+
+  double jetMinPt_{30.0};
+  double jetMaxAbsEta_{2.4};
+  double htJetMinPt_{30.0};
+
+  float  matchJetDR2_{0.16f};
+  bool   doJetMatching_{true};
+
+  double genJetMinPt30_{30.0};
+  double genJetMinPt15_{15.0};
+  double genJetMaxAbsEta_{4.7};
+  double genJetSignalDR_{0.4};
+
+  // ---------------- Tokens
+  edm::EDGetTokenT<GenEventInfoProduct>                 genEvtTok_;
+  edm::EDGetTokenT<std::vector<PileupSummaryInfo>>      puTok_;
+  edm::EDGetTokenT<std::vector<reco::GenParticle>>      prunedGenTok_;
+  edm::EDGetTokenT<std::vector<pat::PackedGenParticle>> packedGenTok_;
+  edm::EDGetTokenT<reco::GenJetCollection>              genJetToken_;
+
+  edm::EDGetTokenT<std::vector<Run3ScoutingPhoton>>     scoutPhoTok_;
+  edm::EDGetTokenT<std::vector<Run3ScoutingTrack>>      scoutTkTok_;
+  edm::EDGetTokenT<std::vector<Run3ScoutingParticle>>   scoutPFCTok_;
+  edm::EDGetTokenT<std::vector<Run3ScoutingPFJet>>      scoutJetTok_;
+
+  // ---------------- Output
+  edm::Service<TFileService> fs_;
+
+  TH1F* h_evt_weight_{nullptr};
+  TH1F* h_evt_nTrueInt_{nullptr};
+  TH1F* h_gen_flags_all_{nullptr};
+  TH1F* h_gen_flags_fid_{nullptr};
+
+  GenHistPack genAll_, genFid_;
+  ScoutHistPack scoutIncl_, scoutMatch_, scoutPFMatch_;
+  MatchHistPack matchH_;
+  PFMatchedPairPack pfPairFromPFCMatch_;
+  PFAnalysisPack pfAna_;
+
+  ScoutJetHistPack  scoutJetIncl_;
+  ScoutJetCompPack  scoutJetComp_;
+  JetMatchHistPack  jetMatch_;
+
+  // GEN jet diagnostics (TFileService)
+  TH1F* h_genjet_n_pt15_      = nullptr;
+  TH1F* h_genjet_n_pt30_      = nullptr;
+  TH1F* h_genjet_ht30_        = nullptr;
+  TH1F* h_genjet1_pt_         = nullptr;
+  TH1F* h_genjet1_eta_        = nullptr;
+  TH1F* h_genjet_minDR_g_     = nullptr;
+  TH1F* h_genjet_minDR_rho_   = nullptr;
+  TH1F* h_genjet_n_away_30_   = nullptr;
+  TH1F* h_genjet_n_near_30_   = nullptr;
+
+  // ---------------- Quality helpers
+  bool passScoutTkQuality_(const Run3ScoutingTrack& t) const {
+    if (t.tk_pt() < tkMinPt_) return false;
+    if (std::abs(t.tk_eta()) > tkMaxAbsEta_) return false;
+    if (t.tk_nTrackerLayersWithMeasurement() < tkMinLayers_) return false;
+    if (std::abs(t.tk_dz()) > tkMaxAbsDz_) return false;
+    if (std::abs(t.tk_dxy()) > tkMaxAbsDxy_) return false;
+    return true;
+  }
+
+  bool passScoutPFQuality_(const Run3ScoutingParticle& p) const {
+    const float pt  = pf_pt(p, pfUseTrkVars_);
+    const float eta = pf_eta(p, pfUseTrkVars_);
+    if (pt < pfcMinPt_) return false;
+    if (std::abs(eta) > pfcMaxAbsEta_) return false;
+    if (std::abs(toF(p.dz()))  > pfcMaxAbsDz_)  return false;
+    if (std::abs(toF(p.dxy())) > pfcMaxAbsDxy_) return false;
+    return true;
+  }
+
+  inline int chargeFromPdgId_(int pdgId) const { return (pdgId > 0) ? +1 : (pdgId < 0 ? -1 : 0); }
+
+  // ---------------- GEN helpers
+  const reco::GenParticle* findLeadingHiggs_(const std::vector<reco::GenParticle>& pruned) const {
+    const reco::GenParticle* higgs = nullptr;
+    for (const auto& gp : pruned) {
+      if (std::abs(gp.pdgId()) != 25) continue;
+      if (!higgs || gp.pt() > higgs->pt()) higgs = &gp;
+    }
+    return higgs;
+  }
+
+  const reco::GenParticle* findGammaFromPrunedDesc_(const reco::GenParticle* higgs) const {
+    if (!higgs) return nullptr;
+    const reco::GenParticle* best = nullptr;
+    float bestPt = -1.f;
+    std::vector<const reco::Candidate*> stack;
+    stack.reserve(64);
+    stack.push_back(higgs);
+    int guard = 0;
+    while (!stack.empty() && guard++ < 2000) {
+      const reco::Candidate* cur = stack.back();
+      stack.pop_back();
+      if (!cur) continue;
+      if (cur->pdgId() == 22) {
+        const float pt = toF(cur->pt());
+        if (pt > bestPt) {
+          bestPt = pt;
+          best = dynamic_cast<const reco::GenParticle*>(cur); // may fail; ok
+        }
+      }
+      const size_t nd = cur->numberOfDaughters();
+      for (size_t i = 0; i < nd; ++i) {
+        const reco::Candidate* d = cur->daughter(i);
+        if (d) stack.push_back(d);
+      }
+    }
+    return best;
+  }
+
+  void collectPackedFromHiggs_(const std::vector<pat::PackedGenParticle>& packed,
+                               std::vector<SimpleCand>& pionsOut,
+                               const pat::PackedGenParticle*& bestGammaOut) const {
+    pionsOut.clear();
+    pionsOut.reserve(128);
+    bestGammaOut = nullptr;
+    float bestGamPt = -1.f;
+
+    for (const auto& pg : packed) {
+      const int id = pg.pdgId();
+      if (!hasAncestorPdgIdAbs(&pg, 25)) continue;
+
+      if (std::abs(id) == 211) {
+        const float pt = toF(pg.pt());
+        if (pt < genPiMinPt_) continue;
+        SimpleCand c;
+        c.pt  = pt;
+        c.eta = toF(pg.eta());
+        c.phi = toF(pg.phi());
+        c.mass = M_PI_CH;
+        c.charge = (id == 211 ? +1 : -1);
+        pionsOut.push_back(c);
+        continue;
+      }
+
+      if (id == 22) {
+        const float pt = toF(pg.pt());
+        if (pt < genPhoMinPt_) continue;
+        if (pt > bestGamPt) { bestGamPt = pt; bestGammaOut = &pg; }
+      }
+    }
+  }
+
+  bool buildGenCandidates_(const edm::Event& ev, bool fidOnly,
+                          bool& hasH, bool& hasG, bool& hasPiPi, bool& hasHcand,
+                          const reco::GenParticle*& higgsOut,
+                          SimpleCand& gammaOut, RhoCand& rhoOut, HCand& hcOut) const;
+
+  bool selectBestScoutPhoton_(const std::vector<Run3ScoutingPhoton>& phos, SimpleCand& out) const;
+  bool selectBestScoutPhotonGivenRho_(const std::vector<Run3ScoutingPhoton>& phos, const TLorentzVector& rhoP4,
+                                      SimpleCand& out, float& outBestScore) const;
+  bool bestScoutTrackPairToRho_(const std::vector<Run3ScoutingTrack>& tks, RhoCand& rhoOut) const;
+};
+
+// ===========================
+// ScoutingHiggsRho.cc  (BLOCK 2/3)
+// ===========================
+
+bool ScoutingHiggsRho::buildGenCandidates_(const edm::Event& ev, bool fidOnly,
+                                           bool& hasH, bool& hasG, bool& hasPiPi, bool& hasHcand,
+                                           const reco::GenParticle*& higgsOut,
+                                           SimpleCand& gammaOut, RhoCand& rhoOut, HCand& hcOut) const {
+  hasH = hasG = hasPiPi = hasHcand = false;
+  higgsOut = nullptr;
+  gammaOut = SimpleCand{};
+  rhoOut = RhoCand{};
+  hcOut = HCand{};
+  hcOut.p4.SetPxPyPzE(0,0,0,0);
+
+  edm::Handle<std::vector<reco::GenParticle>> hPruned;
+  ev.getByToken(prunedGenTok_, hPruned);
+  if (!hPruned.isValid()) return false;
+
+  const reco::GenParticle* higgs = findLeadingHiggs_(*hPruned);
+  if (!higgs) return true;
+  hasH = true;
+  higgsOut = higgs;
+
+  const reco::GenParticle* gamPruned = findGammaFromPrunedDesc_(higgs);
+
+  edm::Handle<std::vector<pat::PackedGenParticle>> hPacked;
+  ev.getByToken(packedGenTok_, hPacked);
+
+  std::vector<SimpleCand> pionsPacked;
+  const pat::PackedGenParticle* gamPacked = nullptr;
+  if (hPacked.isValid()) collectPackedFromHiggs_(*hPacked, pionsPacked, gamPacked);
+
+  auto acceptGammaFid = [&](float eta) { return passAbsEta(eta, fidPhoMaxAbsEta_); };
+  auto acceptPionFid  = [&](float eta) { return passAbsEta(eta, fidPiMaxAbsEta_); };
+
+  if (gamPruned) {
+    const float pt  = toF(gamPruned->pt());
+    const float eta = toF(gamPruned->eta());
+    const float phi = toF(gamPruned->phi());
+    if (pt >= genPhoMinPt_ && (!fidOnly || acceptGammaFid(eta))) {
+      hasG = true;
+      gammaOut.pt = pt; gammaOut.eta = eta; gammaOut.phi = phi; gammaOut.mass = 0.f; gammaOut.charge = 0;
+    }
+  }
+  if (!hasG && gamPacked) {
+    const float pt  = toF(gamPacked->pt());
+    const float eta = toF(gamPacked->eta());
+    const float phi = toF(gamPacked->phi());
+    if (pt >= genPhoMinPt_ && (!fidOnly || acceptGammaFid(eta))) {
+      hasG = true;
+      gammaOut.pt = pt; gammaOut.eta = eta; gammaOut.phi = phi; gammaOut.mass = 0.f; gammaOut.charge = 0;
+    }
+  }
+
+  std::vector<SimpleCand> pionCands;
+  pionCands.reserve(pionsPacked.size());
+  for (const auto& pi : pionsPacked) {
+    if (pi.pt < genPiMinPt_) continue;
+    if (fidOnly && !acceptPionFid(pi.eta)) continue;
+    pionCands.push_back(pi);
+  }
+
+  if (pionCands.empty()) {
+    for (const auto& gp : *hPruned) {
+      if (std::abs(gp.pdgId()) != 211) continue;
+      if (!hasAncestorPdgIdAbs(&gp, 25)) continue;
+      const float pt  = toF(gp.pt());
+      const float eta = toF(gp.eta());
+      const float phi = toF(gp.phi());
+      if (pt < genPiMinPt_) continue;
+      if (fidOnly && !acceptPionFid(eta)) continue;
+      SimpleCand c; c.pt=pt; c.eta=eta; c.phi=phi; c.mass=M_PI_CH; c.charge=(gp.pdgId()==211?+1:-1);
+      pionCands.push_back(c);
+    }
+  }
+
+  SimpleCand piP, piM;
+  RhoCand rho;
+  if (!pionCands.empty() && bestPionPairToRho(pionCands, piP, piM, rho)) { hasPiPi = true; rhoOut = rho; }
+
+  if (hasG && hasPiPi) {
+    TLorentzVector vg, vh;
+    setP4_massless(vg, gammaOut.pt, gammaOut.eta, gammaOut.phi);
+    vh = vg + rhoOut.p4;
+    hasHcand = true;
+    hcOut.gamma = gammaOut;
+    hcOut.rho = rhoOut;
+    hcOut.p4 = vh;
+    hcOut.mass = toF(vh.M());
+  }
+  return true;
+}
+
+bool ScoutingHiggsRho::selectBestScoutPhoton_(const std::vector<Run3ScoutingPhoton>& phos, SimpleCand& out) const {
+  int best = -1; float bestPt = -1.f;
+  for (size_t i = 0; i < phos.size(); ++i) {
+    const auto& p = phos[i];
+    const float pt = toF(p.pt());
+    const float eta = toF(p.eta());
+    if (pt < toF(phoMinPt_)) continue;
+    if (phoMaxAbsEta_ > 0.0 && std::abs(eta) > toF(phoMaxAbsEta_)) continue;
+    if (pt > bestPt) { bestPt = pt; best = int(i); }
+  }
+  if (best < 0) return false;
+  const auto& p = phos[best];
+  out.pt = toF(p.pt()); out.eta = toF(p.eta()); out.phi = toF(p.phi()); out.mass = 0.f; out.charge = 0;
+  return true;
+}
+
+bool ScoutingHiggsRho::selectBestScoutPhotonGivenRho_(const std::vector<Run3ScoutingPhoton>& phos, const TLorentzVector& rhoP4,
+                                                      SimpleCand& out, float& outBestScore) const {
+  int best = -1; float bestScore = 1e9f;
+  for (size_t i = 0; i < phos.size(); ++i) {
+    const auto& p = phos[i];
+    const float pt  = toF(p.pt());
+    const float eta = toF(p.eta());
+    const float phi = toF(p.phi());
+    if (pt < toF(phoMinPt_)) continue;
+    if (phoMaxAbsEta_ > 0.0 && std::abs(eta) > toF(phoMaxAbsEta_)) continue;
+
+    TLorentzVector gP4; setP4_massless(gP4, pt, eta, phi);
+    const TLorentzVector hP4 = rhoP4 + gP4;
+    const float mHcand = toF(hP4.M());
+
+    const float dphi = absDeltaPhi(phi, toF(rhoP4.Phi()));
+    const float dEta = eta - toF(rhoP4.Eta());
+    const float dR2  = dEta*dEta + dphi*dphi;
+
+    const float pull_m   = (mHcand - M_H) / 8.0f;
+    const float pull_pt  = (pt - 60.0f) / 25.0f;
+    const float pull_top = (dphi - float(M_PI)) / 0.6f;
+
+    const float score = pull_m*pull_m + 0.35f*pull_pt*pull_pt + 0.25f*pull_top*pull_top + 0.05f*(dR2/1.0f);
+    if (score < bestScore) { bestScore = score; best = int(i); }
+  }
+  outBestScore = bestScore;
+  if (best < 0) return false;
+  const auto& p = phos[best];
+  out.pt = toF(p.pt()); out.eta = toF(p.eta()); out.phi = toF(p.phi()); out.mass = 0.f; out.charge = 0;
+  return true;
+}
+
+bool ScoutingHiggsRho::bestScoutTrackPairToRho_(const std::vector<Run3ScoutingTrack>& tks, RhoCand& rhoOut) const {
+  float bestDiff = std::numeric_limits<float>::infinity();
+  bool found = false;
+  TLorentzVector best; float bestMass = -1.f;
+  SimpleCand bestP{}, bestM{};
+
+  auto passTk = [&](const Run3ScoutingTrack& t) { return passScoutTkQuality_(t); };
+
+  for (size_t i = 0; i < tks.size(); ++i) {
+    const auto& a = tks[i];
+    if (!passTk(a)) continue;
+    for (size_t j = i + 1; j < tks.size(); ++j) {
+      const auto& b = tks[j];
+      if (!passTk(b)) continue;
+      const int qa = a.tk_charge();
+      const int qb = b.tk_charge();
+      if (qa * qb >= 0) continue;
+
+      TLorentzVector va, vb;
+      setP4_pion(va, toF(a.tk_pt()), toF(a.tk_eta()), toF(a.tk_phi()));
+      setP4_pion(vb, toF(b.tk_pt()), toF(b.tk_eta()), toF(b.tk_phi()));
+      TLorentzVector v = va + vb;
+      const float m = toF(v.M());
+      const float diff = std::abs(m - M_RHO);
+      if (diff < bestDiff) {
+        bestDiff = diff; best = v; bestMass = m; found = true;
+        SimpleCand ca, cb;
+        ca.pt=toF(a.tk_pt()); ca.eta=toF(a.tk_eta()); ca.phi=toF(a.tk_phi()); ca.mass=M_PI_CH; ca.charge=qa;
+        cb.pt=toF(b.tk_pt()); cb.eta=toF(b.tk_eta()); cb.phi=toF(b.tk_phi()); cb.mass=M_PI_CH; cb.charge=qb;
+        if (qa > 0) { bestP = ca; bestM = cb; } else { bestP = cb; bestM = ca; }
+      }
+    }
+  }
+  if (!found) return false;
+  rhoOut.piPlus = bestP; rhoOut.piMinus = bestM; rhoOut.p4 = best; rhoOut.mass = bestMass;
+  return true;
+}
+
+ScoutingHiggsRho::ScoutingHiggsRho(const edm::ParameterSet& cfg) {
+  usesResource("TFileService");
+
+  storeGEN_        = cfg.getUntrackedParameter<bool>("storeGEN", true);
+  storeHistograms_ = cfg.getUntrackedParameter<bool>("storeHistograms", true);
+
+  genEvtTag_    = cfg.getUntrackedParameter<edm::InputTag>("genEventInfo",       edm::InputTag("generator"));
+  puTag_        = cfg.getUntrackedParameter<edm::InputTag>("pileupSummary",      edm::InputTag("slimmedAddPileupInfo"));
+  prunedGenTag_ = cfg.getUntrackedParameter<edm::InputTag>("prunedGenParticles", edm::InputTag("prunedGenParticles"));
+  packedGenTag_ = cfg.getUntrackedParameter<edm::InputTag>("packedGenParticles", edm::InputTag("packedGenParticles"));
+
+  fidPhoMaxAbsEta_ = toF(cfg.getUntrackedParameter<double>("fidPhoMaxAbsEta", 2.5));
+  fidPiMaxAbsEta_  = toF(cfg.getUntrackedParameter<double>("fidPiMaxAbsEta",  2.5));
+  genPhoMinPt_ = toF(cfg.getUntrackedParameter<double>("genPhoMinPt", 0.0));
+  genPiMinPt_  = toF(cfg.getUntrackedParameter<double>("genPiMinPt",  0.0));
+
+  matchPhoDR2_     = toF(cfg.getUntrackedParameter<double>("matchPhoDR2", 0.01));
+  matchTkDR2_      = toF(cfg.getUntrackedParameter<double>("matchTkDR2",  0.01));
+  doTruthMatching_ = cfg.getUntrackedParameter<bool>("doTruthMatching", true);
+
+  doJetMatching_ = cfg.getUntrackedParameter<bool>("doJetMatching", true);
+  matchJetDR2_   = toF(cfg.getUntrackedParameter<double>("matchJetDR2", 0.04)); // (0.2)^2 default
+
+  phoTag_ = cfg.getParameter<edm::InputTag>("photonCollection");
+  tkTag_  = cfg.getParameter<edm::InputTag>("trackCollection");
+  pfcTag_ = cfg.getParameter<edm::InputTag>("pfCandCollection");
+  jetTag_ = cfg.getParameter<edm::InputTag>("pfJetCollection");
+
+  phoMinPt_     = toF(cfg.getUntrackedParameter<double>("phoMinPt", 0.0));
+  phoMaxAbsEta_ = toF(cfg.getUntrackedParameter<double>("phoMaxAbsEta", 0.0));
+
+  tkMinPt_      = toF(cfg.getUntrackedParameter<double>("tkMinPt", 1.0));
+  tkMaxAbsEta_  = toF(cfg.getUntrackedParameter<double>("tkMaxAbsEta", 2.4));
+  tkMinLayers_  = cfg.getUntrackedParameter<int>("tkMinLayers", 4);
+  tkMaxAbsDz_   = toF(cfg.getUntrackedParameter<double>("tkMaxAbsDz", 0.2));
+  tkMaxAbsDxy_  = toF(cfg.getUntrackedParameter<double>("tkMaxAbsDxy", 0.1));
+
+  pfcMinPt_     = toF(cfg.getUntrackedParameter<double>("pfcMinPt", 1.0));
+  pfcMaxAbsEta_ = toF(cfg.getUntrackedParameter<double>("pfcMaxAbsEta", 2.4));
+  pfcMaxAbsDz_  = toF(cfg.getUntrackedParameter<double>("pfcMaxAbsDz", 0.2));
+  pfcMaxAbsDxy_ = toF(cfg.getUntrackedParameter<double>("pfcMaxAbsDxy", 0.1));
+
+  pfPionOnly_   = cfg.getUntrackedParameter<bool>("pfPionOnly", true);
+  pfUseTrkVars_ = cfg.getUntrackedParameter<bool>("pfUseTrkVars", false);
+
+  pfRequireSameVtx_ = cfg.getUntrackedParameter<bool>("pfRequireSameVtx", true);
+  pfMaxAbsDzDiff_   = toF(cfg.getUntrackedParameter<double>("pfMaxAbsDzDiff",  0.05));
+  pfMaxAbsDxyDiff_  = toF(cfg.getUntrackedParameter<double>("pfMaxAbsDxyDiff", 0.05));
+
+  pfRhoMinPt_       = toF(cfg.getUntrackedParameter<double>("pfRhoMinPt", 15.0));
+  pfMinAbsDPhiGRho_ = toF(cfg.getUntrackedParameter<double>("pfMinAbsDPhiGRho", 2.7));
+  pfMinPtBal_       = toF(cfg.getUntrackedParameter<double>("pfMinPtBal", 0.5));
+  pfMaxPtBal_       = toF(cfg.getUntrackedParameter<double>("pfMaxPtBal", 2.0));
+
+  pfRhoMassMin_     = toF(cfg.getUntrackedParameter<double>("pfRhoMassMin", 0.0));
+  pfRhoMassMax_     = toF(cfg.getUntrackedParameter<double>("pfRhoMassMax", 0.0));
+
+  jetMinPt_     = toF(cfg.getUntrackedParameter<double>("jetMinPt", 30.0));
+  htJetMinPt_   = toF(cfg.getUntrackedParameter<double>("htJetMinPt", 30.0));
+  jetMaxAbsEta_ = toF(cfg.getUntrackedParameter<double>("jetMaxAbsEta", 4.7));
+
+  genJetTag_ = cfg.getUntrackedParameter<edm::InputTag>("genJetCollection", edm::InputTag("slimmedGenJets"));
+  genJetMinPt30_   = toF(cfg.getUntrackedParameter<double>("genJetMinPt30", 30.0));
+  genJetMinPt15_   = toF(cfg.getUntrackedParameter<double>("genJetMinPt15", 15.0));
+  genJetMaxAbsEta_ = toF(cfg.getUntrackedParameter<double>("genJetMaxAbsEta", 4.7));
+  genJetSignalDR_  = toF(cfg.getUntrackedParameter<double>("genJetSignalDR", 0.4));
+
+  genEvtTok_    = consumes<GenEventInfoProduct>(genEvtTag_);
+  puTok_        = consumes<std::vector<PileupSummaryInfo>>(puTag_);
+  prunedGenTok_ = consumes<std::vector<reco::GenParticle>>(prunedGenTag_);
+  packedGenTok_ = consumes<std::vector<pat::PackedGenParticle>>(packedGenTag_);
+  scoutPhoTok_  = consumes<std::vector<Run3ScoutingPhoton>>(phoTag_);
+  scoutTkTok_   = consumes<std::vector<Run3ScoutingTrack>>(tkTag_);
+  scoutPFCTok_  = consumes<std::vector<Run3ScoutingParticle>>(pfcTag_);
+  scoutJetTok_  = consumes<std::vector<Run3ScoutingPFJet>>(jetTag_);
+  genJetToken_  = consumes<reco::GenJetCollection>(genJetTag_);
+}
+
+void ScoutingHiggsRho::beginJob() {
+  if (!storeHistograms_) return;
+
+  TFileDirectory dEvt = fs_->mkdir("evt");
+  h_evt_weight_   = dEvt.make<TH1F>("evt_weight",   "event weight;w;events", 200, -2., 2.);
+  h_evt_nTrueInt_ = dEvt.make<TH1F>("evt_nTrueInt", "nTrueInt;nTrueInt;events", 120, 0., 120.);
+
+  TFileDirectory dFlags = fs_->mkdir("flags");
+  h_gen_flags_all_ = dFlags.make<TH1F>("gen_flags_all", "GEN flags (all);bit;events", 16, -0.5, 15.5);
+  h_gen_flags_fid_ = dFlags.make<TH1F>("gen_flags_fid", "GEN flags (fid);bit;events", 16, -0.5, 15.5);
+
+  TFileDirectory dGen = fs_->mkdir("gen");
+  TFileDirectory dGenAll = dGen.mkdir("all");
+  TFileDirectory dGenFid = dGen.mkdir("fid");
+  genAll_.book(dGenAll, "all");
+  genFid_.book(dGenFid, "fid");
+
+  TFileDirectory dScout = fs_->mkdir("scout");
+  TFileDirectory dScoutIncl = dScout.mkdir("inclusive");
+  TFileDirectory dScoutMatch = dScout.mkdir("truthMatched");
+  scoutIncl_.book(dScoutIncl, "incl");
+  scoutMatch_.book(dScoutMatch, "match");
+
+  TFileDirectory dMatch = fs_->mkdir("matching");
+  matchH_.book(dMatch);
+
+  TFileDirectory dScoutPFMatch = dScout.mkdir("truthMatchedPFCands");
+  scoutPFMatch_.book(dScoutPFMatch, "pfc_match");
+  pfPairFromPFCMatch_.book(dScoutPFMatch, "pfc_matchpair");
+
+  TFileDirectory dScoutPFAna = dScout.mkdir("analysisPFCands");
+  pfAna_.book(dScoutPFAna);
+
+  TFileDirectory dScoutJets = dScout.mkdir("jets");
+  TFileDirectory dScoutJetsIncl = dScoutJets.mkdir("inclusive");
+  TFileDirectory dScoutJetsComp = dScoutJets.mkdir("composition");
+  TFileDirectory dScoutJetsMatch = dScoutJets.mkdir("matching");
+  scoutJetIncl_.book(dScoutJetsIncl, "incl");
+  scoutJetComp_.book(dScoutJetsComp, "incl");
+  jetMatch_.book(dScoutJetsMatch);
+
+  TFileDirectory dGenJets = dGen.mkdir("jets");
+  h_genjet_n_pt15_ = dGenJets.make<TH1F>("genjet_n_pt15", "N gen jets (p_{T}>15, |#eta|<4.7);N;events", 15, -0.5, 14.5);
+  h_genjet_n_pt30_ = dGenJets.make<TH1F>("genjet_n_pt30", "N gen jets (p_{T}>30, |#eta|<4.7);N;events", 15, -0.5, 14.5);
+  h_genjet_ht30_   = dGenJets.make<TH1F>("genjet_ht30",   "GEN H_{T} (sum p_{T} jets p_{T}>30, |#eta|<4.7);H_{T} [GeV];events", 200, 0, 1000);
+  h_genjet1_pt_  = dGenJets.make<TH1F>("genjet1_pt",  "Leading gen jet p_{T};p_{T} [GeV];events", 200, 0, 1000);
+  h_genjet1_eta_ = dGenJets.make<TH1F>("genjet1_eta", "Leading gen jet #eta;#eta;events", 120, -6, 6);
+  h_genjet_minDR_g_   = dGenJets.make<TH1F>("genjet_minDR_g",   "min #DeltaR(genJet, gen #gamma);#DeltaR;events", 80, 0, 4.0);
+  h_genjet_minDR_rho_ = dGenJets.make<TH1F>("genjet_minDR_rho", "min #DeltaR(genJet, gen #rho);#DeltaR;events",   80, 0, 4.0);
+  h_genjet_n_away_30_ = dGenJets.make<TH1F>("genjet_nAway_pt30", "N gen jets away from (#gamma,#rho) (p_{T}>30);N;events", 15, -0.5, 14.5);
+  h_genjet_n_near_30_ = dGenJets.make<TH1F>("genjet_nNear_pt30", "N gen jets near (#gamma,#rho) (p_{T}>30);N;events", 15, -0.5, 14.5);
+}
+
+// ===========================
+// ScoutingHiggsRho.cc  (BLOCK 3/3)
+// ===========================
+
+void ScoutingHiggsRho::analyze(const edm::Event& ev, const edm::EventSetup&) {
+  // 0) Event-level (safe for data and MC)
+  {
+    edm::Handle<GenEventInfoProduct> hW;
+    ev.getByToken(genEvtTok_, hW);
+    if (hW.isValid() && h_evt_weight_) h_evt_weight_->Fill(toF(hW->weight()));
+  }
+  {
+    edm::Handle<std::vector<PileupSummaryInfo>> hPU;
+    ev.getByToken(puTok_, hPU);
+    if (hPU.isValid() && h_evt_nTrueInt_) {
+      for (const auto& pu : *hPU) {
+        if (pu.getBunchCrossing() == 0) { h_evt_nTrueInt_->Fill(toF(pu.getTrueNumInteractions())); break; }
+      }
+    }
+  }
+
+  edm::Handle<std::vector<Run3ScoutingPFJet>> hJet;
+  ev.getByToken(scoutJetTok_, hJet);
+
+  // ----------------------------
+  // 1) GEN-only block (do NOT early return)
+  // ----------------------------
+  bool hasH=false, hasG=false, hasPiPi=false, hasHcand=false;
+  const reco::GenParticle* H=nullptr;
+  SimpleCand g; RhoCand rho; HCand hc;
+
+  bool f_hasH=false, f_hasG=false, f_hasPiPi=false, f_hasHcand=false;
+  const reco::GenParticle* f_H=nullptr;
+  SimpleCand f_g; RhoCand f_rho; HCand f_hc;
+
+  edm::Handle<reco::GenJetCollection> hGenJets;
+  edm::Handle<std::vector<pat::PackedGenParticle>> hPacked;
+
+  if (storeGEN_) {
+    buildGenCandidates_(ev, false, hasH, hasG, hasPiPi, hasHcand, H, g, rho, hc);
+    if (hasH && H) genAll_.fillH(*H);
+    if (hasG) genAll_.fillGamma(g);
+
+    ev.getByToken(packedGenTok_, hPacked);
+    if (hPacked.isValid()) {
+      std::vector<SimpleCand> pions; pions.reserve(128);
+      const pat::PackedGenParticle* dummyG=nullptr;
+      collectPackedFromHiggs_(*hPacked, pions, dummyG);
+      std::vector<SimpleCand> pionsPt; pionsPt.reserve(pions.size());
+      for (const auto& pi : pions) if (pi.pt >= genPiMinPt_) pionsPt.push_back(pi);
+      genAll_.fillPions(pionsPt);
+    }
+    if (hasPiPi) genAll_.fillRho(rho);
+    if (hasHcand) genAll_.fillHcand(hc);
+
+    if (h_gen_flags_all_) {
+      int mask=0; if (hasH) mask|=(1<<0); if (hasG) mask|=(1<<1); if (hasPiPi) mask|=(1<<2); if (hasHcand) mask|=(1<<3);
+      for (int b=0;b<16;++b) if (mask&(1<<b)) h_gen_flags_all_->Fill(toF(b));
+    }
+
+    buildGenCandidates_(ev, true, f_hasH, f_hasG, f_hasPiPi, f_hasHcand, f_H, f_g, f_rho, f_hc);
+    if (f_hasH && f_H) genFid_.fillH(*f_H);
+    if (f_hasG) genFid_.fillGamma(f_g);
+
+    if (hPacked.isValid()) {
+      std::vector<SimpleCand> pions; pions.reserve(128);
+      const pat::PackedGenParticle* dummyG=nullptr;
+      collectPackedFromHiggs_(*hPacked, pions, dummyG);
+      std::vector<SimpleCand> pionsF; pionsF.reserve(pions.size());
+      for (const auto& pi : pions) {
+        if (pi.pt < genPiMinPt_) continue;
+        if (!passAbsEta(pi.eta, fidPiMaxAbsEta_)) continue;
+        pionsF.push_back(pi);
+      }
+      genFid_.fillPions(pionsF);
+    }
+    if (f_hasPiPi) genFid_.fillRho(f_rho);
+    if (f_hasHcand) genFid_.fillHcand(f_hc);
+
+    if (h_gen_flags_fid_) {
+      int mask=0; if (f_hasH) mask|=(1<<0); if (f_hasG) mask|=(1<<1); if (f_hasPiPi) mask|=(1<<2); if (f_hasHcand) mask|=(1<<3);
+      for (int b=0;b<16;++b) if (mask&(1<<b)) h_gen_flags_fid_->Fill(toF(b));
+    }
+
+    // GEN jets diagnostics
+    ev.getByToken(genJetToken_, hGenJets);
+    int n15=0, n30=0; double ht30=0.0;
+    double leadPt=-1.0, leadEta=0.0;
+
+    const bool haveGenPho = hasG;
+    const bool haveGenRho = hasPiPi;
+
+    TLorentzVector genPhoP4, genRhoP4;
+    if (haveGenPho) setP4_massless(genPhoP4, g.pt, g.eta, g.phi);
+    if (haveGenRho) genRhoP4 = rho.p4;
+
+    int nNear30=0, nAway30=0;
+    double minDRg=999., minDRrho=999.;
+
+    if (hGenJets.isValid()) {
+      for (const auto& j : *hGenJets) {
+        const double pt=j.pt(), eta=j.eta();
+        if (std::abs(eta) > genJetMaxAbsEta_) continue;
+        if (pt > genJetMinPt15_) n15++;
+        if (pt > genJetMinPt30_) { n30++; ht30 += pt; }
+        if (pt > leadPt) { leadPt=pt; leadEta=eta; }
+
+        if (pt > genJetMinPt30_ && haveGenPho && haveGenRho) {
+          const double dRg   = reco::deltaR(j.eta(), j.phi(), genPhoP4.Eta(), genPhoP4.Phi());
+          const double dRrho = reco::deltaR(j.eta(), j.phi(), genRhoP4.Eta(), genRhoP4.Phi());
+          if (dRg < minDRg) minDRg=dRg;
+          if (dRrho < minDRrho) minDRrho=dRrho;
+          const double dRmin = std::min(dRg, dRrho);
+          if (dRmin < genJetSignalDR_) nNear30++; else nAway30++;
+        }
+      }
+    }
+
+    if (h_genjet_n_pt15_) h_genjet_n_pt15_->Fill(n15);
+    if (h_genjet_n_pt30_) h_genjet_n_pt30_->Fill(n30);
+    if (h_genjet_ht30_)   h_genjet_ht30_->Fill(ht30);
+    if (leadPt > 0) { if (h_genjet1_pt_) h_genjet1_pt_->Fill(leadPt); if (h_genjet1_eta_) h_genjet1_eta_->Fill(leadEta); }
+    if (haveGenPho && haveGenRho && minDRg < 998.)   if (h_genjet_minDR_g_)   h_genjet_minDR_g_->Fill(minDRg);
+    if (haveGenPho && haveGenRho && minDRrho < 998.) if (h_genjet_minDR_rho_) h_genjet_minDR_rho_->Fill(minDRrho);
+    if (haveGenPho && haveGenRho) { if (h_genjet_n_near_30_) h_genjet_n_near_30_->Fill(nNear30); if (h_genjet_n_away_30_) h_genjet_n_away_30_->Fill(nAway30); }
+  }
+
+  // ----------------------------
+  // 2) Scouting inclusive + PF handles
+  // ----------------------------
+  edm::Handle<std::vector<Run3ScoutingPhoton>>   hPho;
+  edm::Handle<std::vector<Run3ScoutingTrack>>    hTk;
+  edm::Handle<std::vector<Run3ScoutingParticle>> hPFC;
+  ev.getByToken(scoutPhoTok_, hPho);
+  ev.getByToken(scoutTkTok_,  hTk);
+  ev.getByToken(scoutPFCTok_, hPFC);
+
+  // Inclusive track histos
+  if (hTk.isValid()) for (const auto& t : *hTk) scoutIncl_.fillTrackInclusive(t);
+
+  // Build scouting rho from tracks
+  RhoCand sRho; bool hasSRho=false;
+  if (hTk.isValid()) {
+    if (bestScoutTrackPairToRho_(*hTk, sRho)) { hasSRho=true; scoutIncl_.fillRho(sRho); }
+  }
+
+  // Photon (prefer conditioned on rho)
+  bool hasSG=false; SimpleCand sG; float bestPhoScore=1e9f;
+  if (hasSRho && hPho.isValid()) {
+    if (selectBestScoutPhotonGivenRho_(*hPho, sRho.p4, sG, bestPhoScore)) { hasSG=true; scoutIncl_.fillPhoton(sG); }
+  } else if (hPho.isValid()) {
+    if (selectBestScoutPhoton_(*hPho, sG)) { hasSG=true; scoutIncl_.fillPhoton(sG); }
+  }
+
+  if (hasSG && hasSRho) {
+    TLorentzVector vg; setP4_massless(vg, sG.pt, sG.eta, sG.phi);
+    HCand sH; sH.gamma=sG; sH.rho=sRho; sH.p4 = vg + sRho.p4; sH.mass=toF(sH.p4.M());
+    scoutIncl_.fillHcand(sH);
+  }
+
+  // ----------------------------
+  // 2A) Inclusive scouting jets
+  // ----------------------------
+  std::vector<int> jetIdx; jetIdx.reserve(hJet.isValid() ? hJet->size() : 0);
+  double ht=0.0;
+
+  if (hJet.isValid()) {
+    for (int i=0;i<(int)hJet->size();++i) {
+      const auto& j = hJet->at(i);
+      const float pt=toF(j.pt()), eta=toF(j.eta());
+      scoutJetIncl_.fillJet(j);
+      scoutJetComp_.fill(j);
+      if (pt < toF(jetMinPt_)) continue;
+      if (std::abs(eta) > toF(jetMaxAbsEta_)) continue;
+      jetIdx.push_back(i);
+      if (pt >= toF(htJetMinPt_)) ht += pt;
+    }
+  }
+  if (hJet.isValid() && !jetIdx.empty()) {
+    std::sort(jetIdx.begin(), jetIdx.end(), [&](int a, int b){ return toF(hJet->at(a).pt()) > toF(hJet->at(b).pt()); });
+  }
+  if (scoutJetIncl_.h_njet) scoutJetIncl_.h_njet->Fill(toF((int)jetIdx.size()));
+  if (scoutJetIncl_.h_ht)   scoutJetIncl_.h_ht->Fill(toF(ht));
+
+  if (hJet.isValid() && jetIdx.size()>=1) {
+    const auto& j1=hJet->at(jetIdx[0]);
+    if (scoutJetIncl_.h_j1_pt) scoutJetIncl_.h_j1_pt->Fill(toF(j1.pt()));
+    if (scoutJetIncl_.h_j1_eta) scoutJetIncl_.h_j1_eta->Fill(toF(j1.eta()));
+  }
+  if (hJet.isValid() && jetIdx.size()>=2) {
+    const auto& j1=hJet->at(jetIdx[0]);
+    const auto& j2=hJet->at(jetIdx[1]);
+    if (scoutJetIncl_.h_j2_pt) scoutJetIncl_.h_j2_pt->Fill(toF(j2.pt()));
+    if (scoutJetIncl_.h_j2_eta) scoutJetIncl_.h_j2_eta->Fill(toF(j2.eta()));
+    TLorentzVector v1, v2;
+    v1.SetPtEtaPhiM(toF(j1.pt()), toF(j1.eta()), toF(j1.phi()), toF(j1.m()));
+    v2.SetPtEtaPhiM(toF(j2.pt()), toF(j2.eta()), toF(j2.phi()), toF(j2.m()));
+    const TLorentzVector v = v1+v2;
+    if (scoutJetIncl_.h_mjj) scoutJetIncl_.h_mjj->Fill(toF(v.M()));
+    const float dphi=absDeltaPhi(toF(j1.phi()), toF(j2.phi()));
+    if (scoutJetIncl_.h_dphi_jj) scoutJetIncl_.h_dphi_jj->Fill(dphi);
+    if (scoutJetIncl_.h_dr2_jj) scoutJetIncl_.h_dr2_jj->Fill(deltaR2(toF(j1.eta()), toF(j1.phi()), toF(j2.eta()), toF(j2.phi())));
+  }
+
+  // 2B) Jet correlations vs (sG, sRho)
+  if (hJet.isValid() && !jetIdx.empty()) {
+    if (hasSG) {
+      float bestDR2=1e9f, bestDPhi=1e9f;
+      for (int idx : jetIdx) {
+        const auto& j=hJet->at(idx);
+        const float dr2 = deltaR2(sG.eta, sG.phi, toF(j.eta()), toF(j.phi()));
+        if (dr2 < bestDR2) bestDR2=dr2;
+        const float dphi = absDeltaPhi(sG.phi, toF(j.phi()));
+        if (dphi < bestDPhi) bestDPhi=dphi;
+      }
+      if (scoutJetIncl_.h_min_dr2_g_j) scoutJetIncl_.h_min_dr2_g_j->Fill(bestDR2);
+      if (scoutJetIncl_.h_min_dphi_g_j) scoutJetIncl_.h_min_dphi_g_j->Fill(bestDPhi);
+      const auto& j1=hJet->at(jetIdx[0]);
+      if (sG.pt>0.f && scoutJetIncl_.h_ptbal_j1_g) scoutJetIncl_.h_ptbal_j1_g->Fill(toF(j1.pt())/sG.pt);
+    }
+    if (hasSRho) {
+      float bestDR2=1e9f, bestDPhi=1e9f;
+      for (int idx : jetIdx) {
+        const auto& j=hJet->at(idx);
+        const float dr2 = deltaR2(sRho.eta(), sRho.phi(), toF(j.eta()), toF(j.phi()));
+        if (dr2 < bestDR2) bestDR2=dr2;
+        const float dphi = absDeltaPhi(sRho.phi(), toF(j.phi()));
+        if (dphi < bestDPhi) bestDPhi=dphi;
+      }
+      if (scoutJetIncl_.h_min_dr2_rho_j) scoutJetIncl_.h_min_dr2_rho_j->Fill(bestDR2);
+      if (scoutJetIncl_.h_min_dphi_rho_j) scoutJetIncl_.h_min_dphi_rho_j->Fill(bestDPhi);
+      const auto& j1=hJet->at(jetIdx[0]);
+      const float rhoPt=sRho.pt();
+      if (rhoPt>0.f && scoutJetIncl_.h_ptbal_j1_rho) scoutJetIncl_.h_ptbal_j1_rho->Fill(toF(j1.pt())/rhoPt);
+    }
+  }
+
+  // ----------------------------
+  // 3) GEN <-> SCOUT jet matching (MC only)
+  // ----------------------------
+  if (storeGEN_ && doJetMatching_) {
+    edm::Handle<reco::GenJetCollection> hGJ;
+    ev.getByToken(genJetToken_, hGJ);
+    if (hGJ.isValid() && hJet.isValid()) {
+      for (const auto& gj : *hGJ) {
+        const float gpt=toF(gj.pt()), geta=toF(gj.eta()), gphi=toF(gj.phi());
+        if (gpt < toF(genJetMinPt30_)) continue;
+        if (std::abs(geta) > toF(genJetMaxAbsEta_)) continue;
+        if (jetMatch_.h_genjet_pt_den) jetMatch_.h_genjet_pt_den->Fill(gpt);
+
+        int best=-1; float bestDR2=matchJetDR2_;
+        for (int i=0;i<(int)hJet->size();++i) {
+          const auto& sj=hJet->at(i);
+          const float dr2=deltaR2(geta, gphi, toF(sj.eta()), toF(sj.phi()));
+          if (dr2 < bestDR2) { bestDR2=dr2; best=i; }
+        }
+        if (best<0) continue;
+
+        const auto& sj=hJet->at(best);
+        const float spt=toF(sj.pt()), seta=toF(sj.eta());
+        if (jetMatch_.h_genjet_pt_num) jetMatch_.h_genjet_pt_num->Fill(gpt);
+        if (jetMatch_.h_dr2) jetMatch_.h_dr2->Fill(bestDR2);
+        if (gpt>0.f && jetMatch_.h_resp_pt) jetMatch_.h_resp_pt->Fill(spt/gpt);
+        if (gpt>0.f && jetMatch_.h_resp_pt_vs_eta) jetMatch_.h_resp_pt_vs_eta->Fill(seta, spt/gpt);
+
+        const float sEMF = jetPHF(sj) + jetELF(sj);
+        if (jetMatch_.h_emf) jetMatch_.h_emf->Fill(sEMF);
+        if (gpt>0.f && jetMatch_.h_resp_pt_vs_emf) jetMatch_.h_resp_pt_vs_emf->Fill(sEMF, spt/gpt);
+      }
+    }
+  }
+
+  // ----------------------------
+  // 4) Truth matching (photon + rho from tracks + pf-cands)
+  // ----------------------------
+  if (storeGEN_ && doTruthMatching_) {
+    // Efficiency denominators
+    if (hasG && matchH_.h_eff_g_den) matchH_.h_eff_g_den->Fill(g.pt);
+    if (hasPiPi && matchH_.h_eff_rho_den) matchH_.h_eff_rho_den->Fill(rho.pt());
+    if (f_hasG && matchH_.h_eff_g_den_fid) matchH_.h_eff_g_den_fid->Fill(f_g.pt);
+    if (f_hasPiPi && matchH_.h_eff_rho_den_fid) matchH_.h_eff_rho_den_fid->Fill(f_rho.pt());
+
+    // --- Match GEN gamma -> SCOUT photon
+    bool matchedG=false;
+    SimpleCand mG;
+    if (hasG && hPho.isValid()) {
+      int best=-1; float bestDR2=matchPhoDR2_;
+      for (int i=0;i<(int)hPho->size();++i) {
+        const auto& p=hPho->at(i);
+        const float dr2 = deltaR2(g.eta, g.phi, toF(p.eta()), toF(p.phi()));
+        if (dr2 < bestDR2) { bestDR2=dr2; best=i; }
+      }
+      if (matchH_.h_dr2_g && bestDR2 < 998.f) matchH_.h_dr2_g->Fill(bestDR2);
+      if (best>=0) {
+        matchedG=true;
+        const auto& p=hPho->at(best);
+        mG.pt=toF(p.pt()); mG.eta=toF(p.eta()); mG.phi=toF(p.phi()); mG.mass=0.f; mG.charge=0;
+        scoutMatch_.fillPhoton(mG);
+        if (matchH_.h_eff_g_num) matchH_.h_eff_g_num->Fill(g.pt);
+        if (hasG && g.pt>0.f && matchH_.h_resp_g_pt) matchH_.h_resp_g_pt->Fill(mG.pt / g.pt);
+        if (f_hasG && matchH_.h_eff_g_num_fid && passAbsEta(g.eta, fidPhoMaxAbsEta_)) matchH_.h_eff_g_num_fid->Fill(g.pt);
+      }
+    }
+
+    // --- Match GEN pions -> SCOUT tracks (two independent best matches)
+    bool matchedPiP=false, matchedPiM=false;
+    Run3ScoutingTrack mTkP, mTkM; // only valid if flags true
+    float dr2_p=999.f, dr2_m=999.f;
+
+    auto matchPionToTrack = [&](const SimpleCand& genPi, int wantCharge, bool& ok, Run3ScoutingTrack& outTk, float& outDR2) {
+      ok=false; outDR2=999.f;
+      if (!hTk.isValid()) return;
+      int best=-1; float bestDR2=matchTkDR2_;
+      for (int i=0;i<(int)hTk->size();++i) {
+        const auto& t=hTk->at(i);
+        if (!passScoutTkQuality_(t)) continue;
+        if (wantCharge!=0 && t.tk_charge()!=wantCharge) continue;
+        const float dr2=deltaR2(genPi.eta, genPi.phi, toF(t.tk_eta()), toF(t.tk_phi()));
+        if (dr2 < bestDR2) { bestDR2=dr2; best=i; }
+      }
+      outDR2 = bestDR2;
+      if (best>=0) { ok=true; outTk = hTk->at(best); }
+    };
+
+    if (hasPiPi) {
+      matchPionToTrack(rho.piPlus, +1, matchedPiP, mTkP, dr2_p);
+      matchPionToTrack(rho.piMinus, -1, matchedPiM, mTkM, dr2_m);
+      if (matchH_.h_dr2_piPlus && dr2_p < 998.f) matchH_.h_dr2_piPlus->Fill(dr2_p);
+      if (matchH_.h_dr2_piMinus && dr2_m < 998.f) matchH_.h_dr2_piMinus->Fill(dr2_m);
+    }
+
+    bool matchedRho=false;
+    RhoCand mRho;
+    if (hasPiPi && matchedPiP && matchedPiM) {
+      TLorentzVector vP, vM;
+      setP4_pion(vP, toF(mTkP.tk_pt()), toF(mTkP.tk_eta()), toF(mTkP.tk_phi()));
+      setP4_pion(vM, toF(mTkM.tk_pt()), toF(mTkM.tk_eta()), toF(mTkM.tk_phi()));
+      TLorentzVector v = vP+vM;
+      matchedRho=true;
+      mRho.p4=v; mRho.mass=toF(v.M());
+      mRho.piPlus = SimpleCand{toF(mTkP.tk_pt()), toF(mTkP.tk_eta()), toF(mTkP.tk_phi()), M_PI_CH, +1};
+      mRho.piMinus= SimpleCand{toF(mTkM.tk_pt()), toF(mTkM.tk_eta()), toF(mTkM.tk_phi()), M_PI_CH, -1};
+      scoutMatch_.fillRho(mRho);
+      if (matchH_.h_eff_rho_num) matchH_.h_eff_rho_num->Fill(rho.pt());
+      if (matchH_.h_resp_rho_m) matchH_.h_resp_rho_m->Fill(mRho.mass - rho.mass);
+      // quality subset: both matched tracks already passed passScoutTkQuality_
+      if (matchH_.h_resp_rho_m_q) matchH_.h_resp_rho_m_q->Fill(mRho.mass - rho.mass);
+
+      if (f_hasPiPi && matchH_.h_eff_rho_num_fid && passAbsEta(rho.eta(), fidPiMaxAbsEta_) && passAbsEta(rho.piPlus.eta, fidPiMaxAbsEta_) && passAbsEta(rho.piMinus.eta, fidPiMaxAbsEta_)) {
+        matchH_.h_eff_rho_num_fid->Fill(rho.pt());
+      }
+      if (hasSRho && matchH_.h_dr2_rho_algo_vs_match) {
+        matchH_.h_dr2_rho_algo_vs_match->Fill(deltaR2(sRho.eta(), sRho.phi(), mRho.eta(), mRho.phi()));
+      }
+    }
+
+    if (matchedG && matchedRho) {
+      TLorentzVector vg; setP4_massless(vg, mG.pt, mG.eta, mG.phi);
+      HCand mH; mH.gamma=mG; mH.rho=mRho; mH.p4 = vg + mRho.p4; mH.mass = toF(mH.p4.M());
+      scoutMatch_.fillHcand(mH);
+      if (hasHcand && matchH_.h_resp_hcand_m) matchH_.h_resp_hcand_m->Fill(mH.mass - hc.mass);
+    }
+
+    // --- Match GEN pions -> PF candidates (and fill dedicated matched-pair pack)
+    if (hasPiPi && hPFC.isValid()) {
+      int bestP=-1, bestM=-1;
+      float bestDR2P=matchTkDR2_, bestDR2M=matchTkDR2_;
+      for (int i=0;i<(int)hPFC->size();++i) {
+        const auto& p=hPFC->at(i);
+        if (pfPionOnly_ && std::abs(p.pdgId())!=211) continue;
+        if (!passScoutPFQuality_(p)) continue;
+        const int q = chargeFromPdgId_(p.pdgId());
+        const float eta=pf_eta(p, pfUseTrkVars_), phi=pf_phi(p, pfUseTrkVars_);
+        if (q>0) {
+          const float dr2 = deltaR2(rho.piPlus.eta, rho.piPlus.phi, eta, phi);
+          if (dr2 < bestDR2P) { bestDR2P=dr2; bestP=i; }
+        } else if (q<0) {
+          const float dr2 = deltaR2(rho.piMinus.eta, rho.piMinus.phi, eta, phi);
+          if (dr2 < bestDR2M) { bestDR2M=dr2; bestM=i; }
+        }
+      }
+      if (bestP>=0 && bestM>=0) {
+        const auto& piP = hPFC->at(bestP);
+        const auto& piM = hPFC->at(bestM);
+        scoutPFMatch_.fillParticleInclusive(piP, pfUseTrkVars_);
+        scoutPFMatch_.fillParticleInclusive(piM, pfUseTrkVars_);
+        pfPairFromPFCMatch_.fill(piP, piM, pfUseTrkVars_);
+      }
+    }
+  }
+
+  // ----------------------------
+  // 5) PF-based rho from ALL OS quality pion pairs (no truth matching)
+  // ----------------------------
+  const bool hasPFPhoton = hasSG;
+  const SimpleCand& gReco = sG;
+
+  int bestPF_i=-1, bestPF_j=-1;
+  float bestScore=std::numeric_limits<float>::infinity();
+
+  float bestHMass=-1.f, bestRhoMass=-1.f, bestPtBal=-1.f, bestDPhi=-1.f;
+  (void)bestHMass; (void)bestRhoMass; (void)bestPtBal; (void)bestDPhi;
+
+  if (hPFC.isValid()) {
+    std::vector<int> piIdx;
+    piIdx.reserve(hPFC->size());
+
+    for (int i=0;i<(int)hPFC->size();++i) {
+      const auto& p = hPFC->at(i);
+      if (pfPionOnly_ && std::abs(p.pdgId())!=211) continue;
+      if (!passScoutPFQuality_(p)) continue;
+      piIdx.push_back(i);
+    }
+
+    for (int a=0;a<(int)piIdx.size();++a) {
+      const auto& pa = hPFC->at(piIdx[a]);
+      const int qa = chargeFromPdgId_(pa.pdgId());
+      const float pta = pf_pt(pa, pfUseTrkVars_), etaa=pf_eta(pa, pfUseTrkVars_), phia=pf_phi(pa, pfUseTrkVars_);
+      for (int b=a+1;b<(int)piIdx.size();++b) {
+        const auto& pb = hPFC->at(piIdx[b]);
+        const int qb = chargeFromPdgId_(pb.pdgId());
+        if (qa*qb >= 0) continue;
+
+        const float ptb = pf_pt(pb, pfUseTrkVars_), etab=pf_eta(pb, pfUseTrkVars_), phib=pf_phi(pb, pfUseTrkVars_);
+
+        TLorentzVector vA, vB; setP4_pion(vA, pta, etaa, phia); setP4_pion(vB, ptb, etab, phib);
+        const TLorentzVector vR = vA+vB;
+        const float mR = toF(vR.M());
+        const float ptR = toF(vR.Pt());
+        const float dphiPP = absDeltaPhi(phia, phib);
+        const float dr2PP = deltaR2(etaa, phia, etab, phib);
+
+        // "all OS quality pairs" pack (already quality-filtered per-cand)
+        if (pfAna_.h_rho_m_all) pfAna_.h_rho_m_all->Fill(mR);
+        if (pfAna_.h_rho_pt_all) pfAna_.h_rho_pt_all->Fill(ptR);
+        if (pfAna_.h_rho_dphi_all) pfAna_.h_rho_dphi_all->Fill(dphiPP);
+        if (pfAna_.h_rho_dr2_all) pfAna_.h_rho_dr2_all->Fill(dr2PP);
+
+        const bool sameV = (pa.vertex() == pb.vertex());
+        if (pfAna_.h_pair_sameVtx_all) pfAna_.h_pair_sameVtx_all->Fill(sameV ? 1.0 : 0.0);
+        if (pfAna_.h_pair_dz_diff_all) pfAna_.h_pair_dz_diff_all->Fill(std::abs(toF(pa.dz()) - toF(pb.dz())));
+        if (pfAna_.h_pair_dxy_diff_all) pfAna_.h_pair_dxy_diff_all->Fill(std::abs(toF(pa.dxy()) - toF(pb.dxy())));
+
+        // Candidate-level with photon (for all pairs if photon exists)
+        if (hasPFPhoton) {
+          TLorentzVector vG; setP4_massless(vG, gReco.pt, gReco.eta, gReco.phi);
+          const TLorentzVector vH = vR + vG;
+          const float mH = toF(vH.M());
+          const float ptH = toF(vH.Pt());
+          const float dphiGR = absDeltaPhi(gReco.phi, toF(vR.Phi()));
+          const float ptbal = (gReco.pt > 0.f) ? (ptR / gReco.pt) : 0.f;
+
+          if (pfAna_.h_hcand_m_all) pfAna_.h_hcand_m_all->Fill(mH);
+          if (pfAna_.h_hcand_pt_all) pfAna_.h_hcand_pt_all->Fill(ptH);
+          if (pfAna_.h_dphi_g_rho_all) pfAna_.h_dphi_g_rho_all->Fill(dphiGR);
+          if (pfAna_.h_ptbal_rho_g_all) pfAna_.h_ptbal_rho_g_all->Fill(ptbal);
+
+          // Vertex-quality cuts (pair-level)
+          bool passVtx=true;
+          if (pfRequireSameVtx_ && !sameV) passVtx=false;
+          if (std::abs(toF(pa.dz()) - toF(pb.dz())) > toF(pfMaxAbsDzDiff_)) passVtx=false;
+          if (std::abs(toF(pa.dxy()) - toF(pb.dxy())) > toF(pfMaxAbsDxyDiff_)) passVtx=false;
+
+          if (passVtx) {
+            if (pfAna_.h_rho_m_vtx) pfAna_.h_rho_m_vtx->Fill(mR);
+            if (pfAna_.h_rho_pt_vtx) pfAna_.h_rho_pt_vtx->Fill(ptR);
+            if (pfAna_.h_hcand_m_vtx) pfAna_.h_hcand_m_vtx->Fill(mH);
+
+            // 3-body cuts
+            bool pass3=true;
+            if (ptR < toF(pfRhoMinPt_)) pass3=false;
+            if (dphiGR < toF(pfMinAbsDPhiGRho_)) pass3=false;
+            if (ptbal < toF(pfMinPtBal_) || ptbal > toF(pfMaxPtBal_)) pass3=false;
+            if (pfRhoMassMax_ > 0.0) {
+              if (mR < toF(pfRhoMassMin_) || mR > toF(pfRhoMassMax_)) pass3=false;
+            }
+
+            if (pass3) {
+              if (pfAna_.h_rho_m_3body) pfAna_.h_rho_m_3body->Fill(mR);
+              if (pfAna_.h_rho_pt_3body) pfAna_.h_rho_pt_3body->Fill(ptR);
+              if (pfAna_.h_hcand_m_3body) pfAna_.h_hcand_m_3body->Fill(mH);
+              if (pfAna_.h_hcand_pt_3body) pfAna_.h_hcand_pt_3body->Fill(ptH);
+
+              // Best-per-event scoring (mass closeness dominates)
+              const float pull_mH = (mH - M_H) / 10.0f;
+              const float pull_mR = (mR - M_RHO) / 0.25f;
+              const float pull_pt = (ptR - 60.0f) / 40.0f;
+              const float score = pull_mH*pull_mH + 0.35f*pull_mR*pull_mR + 0.10f*pull_pt*pull_pt;
+
+              if (score < bestScore) {
+                bestScore = score;
+                bestPF_i = piIdx[a];
+                bestPF_j = piIdx[b];
+                bestHMass = mH;
+                bestRhoMass = mR;
+                bestPtBal = ptbal;
+                bestDPhi = dphiGR;
+              }
+            }
+          }
+        } // hasPFPhoton
+      }
+    }
+
+    // Fill best-per-event histos (after 3-body cuts) if found
+    if (bestPF_i >= 0 && bestPF_j >= 0 && hasPFPhoton) {
+      const auto& pa = hPFC->at(bestPF_i);
+      const auto& pb = hPFC->at(bestPF_j);
+
+      const float pta = pf_pt(pa, pfUseTrkVars_), etaa=pf_eta(pa, pfUseTrkVars_), phia=pf_phi(pa, pfUseTrkVars_);
+      const float ptb = pf_pt(pb, pfUseTrkVars_), etab=pf_eta(pb, pfUseTrkVars_), phib=pf_phi(pb, pfUseTrkVars_);
+
+      TLorentzVector vA, vB; setP4_pion(vA, pta, etaa, phia); setP4_pion(vB, ptb, etab, phib);
+      const TLorentzVector vR = vA+vB;
+
+      TLorentzVector vG; setP4_massless(vG, gReco.pt, gReco.eta, gReco.phi);
+      const TLorentzVector vH = vR + vG;
+
+      const float mR = toF(vR.M());
+      const float mH = toF(vH.M());
+      const float ptbal = (gReco.pt > 0.f) ? (toF(vR.Pt()) / gReco.pt) : 0.f;
+      const float dphiGR = absDeltaPhi(gReco.phi, toF(vR.Phi()));
+
+      if (pfAna_.h_hcand_m_best) pfAna_.h_hcand_m_best->Fill(mH);
+      if (pfAna_.h_rho_m_best) pfAna_.h_rho_m_best->Fill(mR);
+      if (pfAna_.h_ptbal_rho_g_best) pfAna_.h_ptbal_rho_g_best->Fill(ptbal);
+      if (pfAna_.h_dphi_g_rho_best) pfAna_.h_dphi_g_rho_best->Fill(dphiGR);
+    }
+  }
+
+} // analyze
+
+DEFINE_FWK_MODULE(ScoutingHiggsRho);

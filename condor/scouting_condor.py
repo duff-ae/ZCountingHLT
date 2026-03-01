@@ -5,7 +5,9 @@ import subprocess
 vdm_runs = [394413, 394426, 394431, 394467, 394468, 394469, 394494]
 runs = [394467, 394468, 394469, 394494]
 
-runs = [394702]
+runs = [393240]
+runs = [395505]
+
 for run in runs:
     input_txt = f"run_list/{run}.txt"  # Input list of ROOT files
     submit_dir = "condor_submissions"  # Directory to store submit files
@@ -49,7 +51,7 @@ for run in runs:
 
     +AccountingGroup = "group_u_CMS.CAF.COMM"
 
-    transfer_input_files = /afs/cern.ch/user/a/alshevel/private/CMSSW_15_0_6/src/Demo/HLTScouting/python/zcounting_cfg.py
+    transfer_input_files = /afs/cern.ch/user/a/alshevel/private/CMSSW_15_0_6/src/Demo/HLTScouting/python/lumi_cfg.py
 
     use_x509userproxy = true
     x509userproxy = /afs/cern.ch/user/a/alshevel/private/CMSSW_15_0_6/src/Demo/HLTScouting/proxy.pem
